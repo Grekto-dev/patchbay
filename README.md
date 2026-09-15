@@ -65,8 +65,8 @@ directly when it is also the text backend, through an OCR hand-off otherwise.
 |---|---|
 | **Node.js 18+** | `node --version`. The setup scripts install it on Windows via winget if missing. |
 | **Claude Desktop** | Already installed and updated. |
-| **One text provider key** | [OpenCode Go](https://opencode.ai) · [DeepSeek](https://platform.deepseek.com) · [GLM / Z.ai](https://z.ai) — pick one, or several and switch in the panel. |
-| **A Google AI Studio key** | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free tier, no card. Needed for images, and enough on its own if you want Google to answer everything. |
+| **A text provider key** | [OpenCode Go](https://opencode.ai) · [DeepSeek](https://platform.deepseek.com) · [GLM / Z.ai](https://z.ai) · [Google AI Studio](https://aistudio.google.com/apikey) — one of them is enough; configure several and switch in the panel. |
+| **A Google AI Studio key** | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free tier, no card. It handles images whichever provider answers the text, so it is worth having even when it is not your text backend. |
 
 ---
 
