@@ -34,8 +34,9 @@ const MAX_LOG_LINES = 800;
 
 // Gemini is both the image backend and a text provider, so it belongs in the
 // same list as the others - it is simply last in the proxy's priority order.
-const PROVIDERS = [
+const BUILTIN_PROVIDERS = [
   { key: "opencode", label: "OpenCode Go", env: "OPENCODE_API_KEY", url: "https://opencode.ai" },
+  { key: "openrouter", label: "OpenRouter", env: "OPENROUTER_API_KEY", url: "https://openrouter.ai/keys" },
   { key: "glm", label: "GLM (Z.ai)", env: "GLM_API_KEY", url: "https://z.ai" },
   { key: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY", url: "https://platform.deepseek.com" },
   {
@@ -46,7 +47,34 @@ const PROVIDERS = [
     note: "also the image / OCR backend, whichever provider handles text",
   },
 ];
-const ALL_KEY_FIELDS = PROVIDERS;
+
+// Custom OpenAI-compatible providers (Ollama, LM Studio, vLLM, a company
+// gateway). Declared in proxy-config.json; their key, when one is needed,
+// lives in .env like every other secret.
+function envKeyNameFor(key) {
+  return "PATCHBAY_" + String(key).toUpperCase().replace(/[^A-Z0-9]+/g, "_") + "_API_KEY";
+}
+
+function customProviderEntries() {
+  const list = readConfig().customProviders;
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((p) => p && typeof p === "object" && /^[a-z0-9][a-z0-9-]*$/.test(String(p.key || "")))
+    .filter((p) => !BUILTIN_PROVIDERS.some((b) => b.key === p.key))
+    .map((p) => ({
+      key: String(p.key),
+      label: String(p.label || p.key),
+      env: envKeyNameFor(p.key),
+      url: String(p.baseUrl || ""),
+      baseUrl: String(p.baseUrl || ""),
+      custom: true,
+      note: "OpenAI-compatible endpoint \u00b7 " + String(p.baseUrl || ""),
+    }));
+}
+
+function providers() {
+  return [...BUILTIN_PROVIDERS, ...customProviderEntries()];
+}
 
 // Last-resort maps, used only if proxy/server.js cannot be parsed.
 const FALLBACK_MAPS = {
@@ -169,8 +197,11 @@ function readConfig() {
 function writeConfig(cfg) {
   const clean = {};
   if (Number(cfg.port) > 0) clean.port = Number(cfg.port);
-  if (typeof cfg.provider === "string" && PROVIDERS.some((p) => p.key === cfg.provider)) {
+  if (typeof cfg.provider === "string" && providers().some((p) => p.key === cfg.provider)) {
     clean.provider = cfg.provider;
+  }
+  if (Array.isArray(cfg.customProviders) && cfg.customProviders.length) {
+    clean.customProviders = cfg.customProviders;
   }
   for (const field of ["discovery", "catalogEnabled", "catalogIds"]) {
     const value = cfg[field];
@@ -211,7 +242,7 @@ function defaultModelMaps() {
     return FALLBACK_MAPS;
   }
   const out = {};
-  for (const { key } of PROVIDERS) {
+  for (const { key } of BUILTIN_PROVIDERS) {
     const start = src.indexOf("\n  " + key + ": {");
     if (start < 0) {
       out[key] = FALLBACK_MAPS[key];
@@ -251,6 +282,9 @@ const CATALOG_SOURCES = {
     ],
   },
   deepseek: { sources: [{ host: "api.deepseek.com", path: "/models" }] },
+  // OpenRouter reports pricing and modalities itself, so its catalog needs no
+  // help from models.dev.
+  openrouter: { sources: [{ host: "openrouter.ai", path: "/api/v1/models", parse: "openrouter" }] },
   gemini: {
     sources: [
       {
@@ -271,8 +305,35 @@ const CATALOG_SOURCES = {
 };
 
 const catalogCache = {};
-for (const key of Object.keys(CATALOG_SOURCES)) {
-  catalogCache[key] = { models: [], surfaces: {}, fetchedAt: 0, error: null };
+function catalogState(key) {
+  if (!catalogCache[key]) catalogCache[key] = { models: [], surfaces: {}, fetchedAt: 0, error: null };
+  return catalogCache[key];
+}
+for (const key of Object.keys(CATALOG_SOURCES)) catalogState(key);
+
+// Built-in providers have a fixed source table; a custom one derives its
+// /models endpoint from the base URL it was configured with.
+function catalogSourcesFor(key) {
+  if (CATALOG_SOURCES[key]) return CATALOG_SOURCES[key];
+  const entry = customProviderEntries().find((p) => p.key === key);
+  if (!entry) return null;
+  let url;
+  try {
+    url = new URL(entry.baseUrl);
+  } catch {
+    return null;
+  }
+  const base = url.pathname.replace(/\/+$/, "");
+  return {
+    sources: [
+      {
+        host: url.hostname,
+        scheme: url.protocol === "http:" ? "http" : "https",
+        port: url.port ? Number(url.port) : undefined,
+        path: base + "/models",
+      },
+    ],
+  };
 }
 
 // The provider APIs return ids and nothing else - no pricing, no "this one is
@@ -382,7 +443,7 @@ function sanitizeClaudeId(raw) {
 }
 
 function envKeyFor(provider) {
-  const field = PROVIDERS.find((p) => p.key === provider);
+  const field = providers().find((p) => p.key === provider);
   return field ? readEnvFile()[field.env] : null;
 }
 
@@ -395,36 +456,65 @@ function isFreeModel(provider, model) {
 }
 
 function fetchProviderList(provider, key, index, cb) {
-  const spec = CATALOG_SOURCES[provider] || { sources: [] };
+  const spec = catalogSourcesFor(provider) || { sources: [] };
   const sources = spec.sources;
   const source = sources[index];
   if (!source) return cb(new Error("no endpoint answered"), null);
 
-  const useQueryAuth = source.auth === "query";
+  const useQueryAuth = source.auth === "query" && Boolean(key);
   const reqPath = useQueryAuth
     ? source.path + (source.path.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key)
     : source.path;
+  const transport = source.scheme === "http" ? http : https;
 
-  const req = https.request(
+  const req = transport.request(
     {
       hostname: source.host,
-      port: 443,
+      port: source.port || (source.scheme === "http" ? 80 : 443),
       path: reqPath,
       method: "GET",
       timeout: 15000,
-      headers: useQueryAuth
-        ? { "User-Agent": "claude-desktop-proxy-panel" }
-        : { Authorization: "Bearer " + key, "x-api-key": key, "User-Agent": "claude-desktop-proxy-panel" },
+      headers: useQueryAuth || !key
+        ? { "User-Agent": "patchbay-panel" }
+        : { Authorization: "Bearer " + key, "x-api-key": key, "User-Agent": "patchbay-panel" },
     },
     (res) => {
       let d = "";
+      let sourcePricing = null;
       res.on("data", (c) => (d += c));
       res.on("end", () => {
         let models = null;
         try {
           const json = JSON.parse(d);
+          if (source.parse === "openrouter") {
+            // Pricing comes in the same payload, in dollars per token.
+            sourcePricing = {};
+            for (const m of json.data || []) {
+              const inCost = Number(m.pricing && m.pricing.prompt) * 1e6;
+              const outCost = Number(m.pricing && m.pricing.completion) * 1e6;
+              if (!Number.isFinite(inCost) || !Number.isFinite(outCost)) continue;
+              sourcePricing[m.id] = {
+                free: inCost === 0 && outCost === 0,
+                input: Number(inCost.toFixed(4)),
+                output: Number(outCost.toFixed(4)),
+                source: "openrouter",
+              };
+            }
+          }
           models =
-            source.parse === "google"
+            source.parse === "openrouter"
+              ? // Text-output models only; the rest also emit images or audio.
+                (json.data || [])
+                  .filter((m) => {
+                    // Audio output means speech or music; image listed first
+                    // means an image generator. Image as a secondary output is
+                    // fine - that is what the openrouter/auto routers report.
+                    const out = (m.architecture && m.architecture.output_modalities) || ["text"];
+                    return out.includes("text") && !out.includes("audio") && out.indexOf("image") !== 0;
+                  })
+                  .map((m) => m.id)
+                  .filter(Boolean)
+              : source.parse === "google"
               ? // Google answers { models: [{ name: "models/x", supportedGenerationMethods }] }
                 (json.models || [])
                   .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
@@ -438,6 +528,7 @@ function fetchProviderList(provider, key, index, cb) {
           if (source.freeOnly) models = models.filter((m) => isFreeModel(provider, m));
           const surfaces = {};
           for (const m of models) surfaces[m] = source.surface || null;
+          if (sourcePricing) surfaces.__pricing = sourcePricing;
           if (spec.merge && index + 1 < sources.length) {
             return fetchProviderList(provider, key, index + 1, (err2, more, moreSurfaces) => {
               if (err2 || !more || !more.length) return cb(null, models, surfaces);
@@ -474,19 +565,24 @@ function fetchProviderList(provider, key, index, cb) {
 }
 
 function fetchCatalog(provider, cb) {
-  const state = catalogCache[provider];
+  const state = catalogState(provider);
   const key = envKeyFor(provider);
-  if (isPlaceholder(key)) {
+  const entry = providers().find((p) => p.key === provider);
+  const keyless = Boolean(entry && entry.custom);
+  if (isPlaceholder(key) && !keyless) {
     state.error = "no API key configured";
     state.models = [];
     return cb(state);
   }
-  fetchProviderList(provider, key.trim(), 0, (err, models, surfaces) => {
+  fetchProviderList(provider, isPlaceholder(key) ? "" : key.trim(), 0, (err, models, surfaces) => {
     if (err) {
       state.error = err.message;
     } else {
+      const meta = surfaces || {};
+      state.pricing = meta.__pricing || null;
+      delete meta.__pricing;
       state.models = models;
-      state.surfaces = surfaces || {};
+      state.surfaces = meta;
       state.fetchedAt = Date.now();
       state.error = null;
     }
@@ -502,12 +598,15 @@ function fetchAllCatalogs(force, cb) {
 }
 
 function fetchAllCatalogsNow(force, cb) {
-  const providers = Object.keys(CATALOG_SOURCES);
-  let pending = providers.length;
+  const list = providers()
+    .map((p) => p.key)
+    .filter((key) => catalogSourcesFor(key));
+  let pending = list.length;
   if (!pending) return cb();
-  for (const provider of providers) {
-    const state = catalogCache[provider];
-    const hasKey = !isPlaceholder(envKeyFor(provider));
+  for (const provider of list) {
+    const state = catalogState(provider);
+    const entry = providers().find((p) => p.key === provider);
+    const hasKey = Boolean(entry && entry.custom) || !isPlaceholder(envKeyFor(provider));
     const stale = Date.now() - state.fetchedAt > 5 * 60 * 1000;
     const shouldFetch = hasKey && (force || (!state.models.length && stale) || stale);
     if (!shouldFetch) {
@@ -913,22 +1012,26 @@ function buildState(cb) {
   const env = readEnvFile();
   const cfg = readConfig();
   const defaults = defaultModelMaps();
+  const all = providers();
 
-  const keys = ALL_KEY_FIELDS.map((f) => ({
+  const keys = all.map((f) => ({
     key: f.key,
     env: f.env,
     label: f.label,
     url: f.url,
     note: f.note || null,
+    custom: Boolean(f.custom),
+    baseUrl: f.baseUrl || null,
     set: !isPlaceholder(env[f.env]),
     masked: maskKey(env[f.env] || ""),
   }));
 
-  const configured = PROVIDERS.filter((p) => !isPlaceholder(env[p.env])).map((p) => p.key);
+  // A local endpoint needs no key, so having one is not what makes it usable.
+  const configured = all.filter((p) => p.custom || !isPlaceholder(env[p.env])).map((p) => p.key);
   const active = cfg.provider && configured.includes(cfg.provider) ? cfg.provider : configured[0] || null;
 
   const models = {};
-  for (const p of PROVIDERS) {
+  for (const p of BUILTIN_PROVIDERS) {
     models[p.key] = {};
     for (const [cModel, uModel] of Object.entries(defaults[p.key] || {})) {
       const override = cfg.models && cfg.models[p.key] && cfg.models[p.key][cModel];
@@ -951,7 +1054,7 @@ function buildState(cb) {
         port: proxyPort(),
         upstream: alive || null,
       },
-      providers: PROVIDERS,
+      providers: all,
       keys,
       envExists: fs.existsSync(ENV_PATH),
       pinnedProvider: cfg.provider || null,
@@ -1062,15 +1165,20 @@ const server = http.createServer((req, res) => {
       const ids = cfg.catalogIds && typeof cfg.catalogIds === "object" ? cfg.catalogIds : {};
       const env = readEnvFile();
 
-      const providers = PROVIDERS.filter((p) => CATALOG_SOURCES[p.key]).map((p) => {
-        const state = catalogCache[p.key];
+      const cards = providers()
+        .filter((p) => catalogSourcesFor(p.key))
+        .map((p) => {
+        const state = catalogState(p.key);
         const overrides = ids[p.key] && typeof ids[p.key] === "object" ? ids[p.key] : {};
-        const costs = pricing.byProvider[p.key] || {};
+        // A provider that reports its own pricing beats the models.dev copy.
+        const costs = { ...(pricing.byProvider[p.key] || {}), ...(state.pricing || {}) };
         return {
           key: p.key,
           label: p.label,
           env: p.env,
-          hasKey: !isPlaceholder(env[p.env]),
+          custom: Boolean(p.custom),
+          baseUrl: p.baseUrl || null,
+          hasKey: p.custom ? true : !isPlaceholder(env[p.env]),
           discovery: discovery[p.key] === true,
           models: state.models,
           enabled: Array.isArray(enabled[p.key]) ? enabled[p.key] : null,
@@ -1084,7 +1192,7 @@ const server = http.createServer((req, res) => {
       });
 
       sendJSON(res, 200, {
-        providers,
+        providers: cards,
         port: proxyPort(),
         desktop: desktopLibraryInfo(),
         pricing: { source: "models.dev", fetchedAt: pricing.fetchedAt || null, error: pricing.error },
@@ -1095,7 +1203,7 @@ const server = http.createServer((req, res) => {
 
   if (url === "/api/catalog/save" && req.method === "POST") {
     return readBody(req, (body) => {
-      if (!body || !CATALOG_SOURCES[body.provider]) return sendJSON(res, 400, { error: "unknown provider" });
+      if (!body || !catalogSourcesFor(body.provider)) return sendJSON(res, 400, { error: "unknown provider" });
       const provider = body.provider;
       const cfg = readConfig();
 
@@ -1160,7 +1268,7 @@ const server = http.createServer((req, res) => {
     return readBody(req, (body) => {
       if (!body) return sendJSON(res, 400, { error: "invalid JSON" });
       const updates = {};
-      for (const f of ALL_KEY_FIELDS) {
+      for (const f of providers()) {
         const v = body[f.env];
         if (typeof v !== "string") continue; // field untouched
         if (v === "") continue; // empty input keeps the current key
@@ -1188,7 +1296,7 @@ const server = http.createServer((req, res) => {
 
       if ("provider" in body) {
         if (!body.provider || body.provider === "auto") delete cfg.provider;
-        else if (PROVIDERS.some((p) => p.key === body.provider)) cfg.provider = body.provider;
+        else if (providers().some((p) => p.key === body.provider)) cfg.provider = body.provider;
         else return sendJSON(res, 400, { error: "unknown provider" });
       }
 
@@ -1218,6 +1326,87 @@ const server = http.createServer((req, res) => {
 
       try {
         const saved = writeConfig(cfg);
+        return sendJSON(res, 200, { ok: true, config: saved, needsRestart: true });
+      } catch (e) {
+        return sendJSON(res, 500, { error: e.message });
+      }
+    });
+  }
+
+  // ── Custom OpenAI-compatible providers ──
+  if (url === "/api/providers" && req.method === "POST") {
+    return readBody(req, (body) => {
+      if (!body) return sendJSON(res, 400, { error: "invalid JSON" });
+
+      const key = String(body.key || "").trim().toLowerCase();
+      if (!/^[a-z0-9][a-z0-9-]*$/.test(key)) {
+        return sendJSON(res, 400, { error: "the id must be lowercase letters, digits or dashes" });
+      }
+      if (BUILTIN_PROVIDERS.some((p) => p.key === key)) {
+        return sendJSON(res, 400, { error: "that id belongs to a built-in provider" });
+      }
+
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(String(body.baseUrl || "").trim());
+      } catch {
+        return sendJSON(res, 400, { error: "invalid base URL" });
+      }
+      if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+        return sendJSON(res, 400, { error: "the base URL must be http or https" });
+      }
+
+      const entry = {
+        key,
+        label: String(body.label || key).trim().slice(0, 60),
+        // Stored without a trailing slash: /chat/completions and /models hang off it.
+        baseUrl: parsedUrl.origin + parsedUrl.pathname.replace(/\/+$/, ""),
+      };
+
+      const cfg = readConfig();
+      const list = Array.isArray(cfg.customProviders) ? [...cfg.customProviders] : [];
+      const at = list.findIndex((p) => p && p.key === key);
+      if (at >= 0) list[at] = { ...list[at], ...entry };
+      else list.push(entry);
+      cfg.customProviders = list;
+
+      try {
+        if (typeof body.apiKey === "string" && body.apiKey.trim() && body.apiKey !== "__CLEAR__") {
+          writeEnvFile({ [envKeyNameFor(key)]: body.apiKey.trim() });
+        } else if (body.apiKey === "__CLEAR__") {
+          writeEnvFile({ [envKeyNameFor(key)]: "" });
+        }
+        const saved = writeConfig(cfg);
+        delete catalogCache[key]; // force a fresh fetch with the new base URL
+        pushLog("[panel] custom provider saved: " + key + " (" + entry.baseUrl + ")", "info");
+        return sendJSON(res, 200, { ok: true, config: saved, needsRestart: true });
+      } catch (e) {
+        return sendJSON(res, 500, { error: e.message });
+      }
+    });
+  }
+
+  if (url === "/api/providers/delete" && req.method === "POST") {
+    return readBody(req, (body) => {
+      if (!body || !body.key) return sendJSON(res, 400, { error: "missing provider id" });
+      const key = String(body.key);
+      const cfg = readConfig();
+      const list = Array.isArray(cfg.customProviders) ? cfg.customProviders : [];
+      const next = list.filter((p) => p && p.key !== key);
+      if (next.length === list.length) return sendJSON(res, 404, { error: "unknown custom provider" });
+
+      cfg.customProviders = next;
+      // Anything pinned to or configured for it would dangle otherwise.
+      if (cfg.provider === key) delete cfg.provider;
+      for (const field of ["discovery", "catalogEnabled", "catalogIds"]) {
+        if (cfg[field] && typeof cfg[field] === "object") delete cfg[field][key];
+      }
+
+      try {
+        writeEnvFile({ [envKeyNameFor(key)]: "" });
+        const saved = writeConfig(cfg);
+        delete catalogCache[key];
+        pushLog("[panel] custom provider removed: " + key, "info");
         return sendJSON(res, 200, { ok: true, config: saved, needsRestart: true });
       } catch (e) {
         return sendJSON(res, 500, { error: e.message });

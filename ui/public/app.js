@@ -110,6 +110,7 @@ function render(s, force) {
   renderChecklist(s);
   if (force || !sectionBusy("#key-fields")) renderKeys(s);
   if (force || !sectionBusy("#provider-list")) renderProviders(s);
+  renderCustomProviders(s);
   if (document.activeElement !== $("#inp-port")) $("#inp-port").value = s.proxy.port;
   renderDiag(s);
 
@@ -251,10 +252,60 @@ function removeKey(k, btn) {
   });
 }
 
+// Custom providers live in proxy-config.json, not in the built-in table, so
+// they are listed with their base URL and can be removed again.
+function renderCustomProviders(s) {
+  const custom = s.keys.filter((k) => k.custom);
+  setChildren(
+    $("#custom-list"),
+    custom.length
+      ? custom.map((k) =>
+          row(
+            k.label,
+            el("span", { class: "tag info" }, k.key),
+            " ",
+            k.baseUrl || "",
+            " ",
+            el("button", { class: "rm", type: "button", onclick: (e) => removeCustomProvider(k, e.target) }, "remove")
+          )
+        )
+      : [el("p", { class: "hint", style: "margin:0" }, "None yet — add one below.")]
+  );
+}
+
+function removeCustomProvider(k, btn) {
+  if (!confirm("Remove " + k.label + "?\n\nIts entry, its key and any model selection for it are deleted.")) return;
+  return withBusy(btn, async () => {
+    const r = await api("/api/providers/delete", { key: k.key });
+    if (r.error) return toast(r.error, "err");
+    toast(k.label + " removed.", "ok");
+    if (state && state.proxy.running) markRestart(true);
+    loadCatalog(false);
+  });
+}
+
+$("#btn-add-provider").addEventListener("click", (e) =>
+  withBusy(e.target, async () => {
+    const payload = {
+      key: $("#cp-key").value.trim().toLowerCase(),
+      label: $("#cp-label").value.trim(),
+      baseUrl: $("#cp-url").value.trim(),
+      apiKey: $("#cp-token").value.trim(),
+    };
+    if (!payload.key || !payload.baseUrl) return toast("Id and base URL are required.", "err");
+    const r = await api("/api/providers", payload);
+    if (r.error) return toast(r.error, "err");
+    toast((payload.label || payload.key) + " added — check the Models tab.", "ok");
+    for (const id of ["#cp-key", "#cp-label", "#cp-url", "#cp-token"]) $(id).value = "";
+    if (state && state.proxy.running) markRestart(true);
+    loadCatalog(true);
+  })
+);
+
 function renderProviders(s) {
   const current = s.pinnedProvider || "auto";
   const opts = [
-    { key: "auto", label: "Automatic", desc: "Follows the OpenCode Go → GLM → DeepSeek → Google priority across the configured keys.", enabled: true },
+    { key: "auto", label: "Automatic", desc: "Follows the OpenCode Go → OpenRouter → GLM → DeepSeek → Google priority, custom providers last.", enabled: true },
     ...s.providers.map((p) => ({
       key: p.key,
       label: p.label,

@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+const http = require("http");
 
 // Load .env if present
 const envPath = path.join(__dirname, "..", ".env");
@@ -82,6 +83,22 @@ const ENDPOINTS = {
     defaultModel: "deepseek-v4-flash",
     type: "opencode",
   },
+  openrouter: {
+    label: "OpenRouter",
+    host: "openrouter.ai",
+    basePath: "/api/v1/chat/completions",
+    apiKey: process.env.OPENROUTER_API_KEY || null,
+    // openrouter/auto picks a model per request and openrouter/free stays on
+    // the zero-cost ones, so these defaults survive the catalog churning.
+    modelMap: {
+      "claude-sonnet-4-5": "openrouter/auto",
+      "claude-sonnet-4-6": "openrouter/auto",
+      "claude-opus-4-7": "openrouter/auto",
+      "claude-haiku-4-5-20251001": "openrouter/free",
+    },
+    defaultModel: "openrouter/auto",
+    type: "openai",
+  },
   glm: {
     label: "GLM (Z.ai)",
     host: "api.z.ai",
@@ -97,6 +114,22 @@ const ENDPOINTS = {
     type: "anthropic",
   },
 };
+
+for (const [key, ep] of Object.entries(ENDPOINTS)) ep.key = key;
+
+// The ids every built-in provider maps - the ones Claude Desktop ships with.
+// Captured before discovery starts adding to the maps, so a generic request
+// can be told apart from a deliberate "give me that exact model".
+const CANONICAL_IDS = new Set(
+  Object.values(ENDPOINTS).flatMap((ep) => Object.keys(ep.modelMap || {}))
+);
+
+// A local model server (Ollama, LM Studio) needs no credentials, so "ready"
+// is not the same as "has an API key".
+function providerReady(key) {
+  const ep = ENDPOINTS[key];
+  return Boolean(ep && (ep.apiKey || ep.custom));
+}
 
 // Model-map overrides from proxy-config.json:
 //   { "models": { "glm": { "claude-sonnet-4-5": "glm-5.2" } } }
@@ -117,15 +150,8 @@ if (OVERRIDES.models && typeof OVERRIDES.models === "object") {
 // OpenAI-format conversion (type: "opencode").
 // Gemini sits last: its key is usually present for images alone, so it should
 // only take over the text when nothing else is configured - or when pinned.
-let TEXT_PROVIDER_PRIORITY = ["opencode", "glm", "deepseek", "gemini"];
+let TEXT_PROVIDER_PRIORITY = ["opencode", "openrouter", "glm", "deepseek", "gemini"];
 
-// The control panel can pin one provider instead of relying on key priority.
-if (typeof OVERRIDES.provider === "string" && TEXT_PROVIDER_PRIORITY.includes(OVERRIDES.provider)) {
-  TEXT_PROVIDER_PRIORITY = [
-    OVERRIDES.provider,
-    ...TEXT_PROVIDER_PRIORITY.filter((k) => k !== OVERRIDES.provider),
-  ];
-}
 
 // ── Live provider catalogs ───────────────────────────
 // Every text provider publishes an OpenAI-style model list. With
@@ -147,6 +173,9 @@ const CATALOG_SOURCES = {
     ],
   },
   deepseek: { sources: [{ host: "api.deepseek.com", path: "/models" }] },
+  // OpenRouter reports pricing and modalities itself, so the catalog is
+  // filtered to text-output models without asking models.dev.
+  openrouter: { sources: [{ host: "openrouter.ai", path: "/api/v1/models", parse: "openrouter" }] },
   gemini: {
     sources: [
       {
@@ -170,6 +199,68 @@ const CATALOG_TTL_MS = 30 * 60 * 1000;
 const CATALOGS = {};
 for (const key of Object.keys(CATALOG_SOURCES)) {
   CATALOGS[key] = { models: [], fetchedAt: 0, error: null };
+}
+
+// ── Custom OpenAI-compatible providers ───────────────────
+// Anything that speaks /v1/chat/completions - Ollama, LM Studio, vLLM,
+// llama.cpp, a company gateway - declared in proxy-config.json as:
+//   "customProviders": [{ "key": "ollama", "label": "Ollama",
+//                         "baseUrl": "http://127.0.0.1:11434/v1" }]
+// The key, when the endpoint needs one, comes from PATCHBAY_<KEY>_API_KEY in
+// .env so secrets stay in one file.
+function envKeyNameFor(key) {
+  return "PATCHBAY_" + String(key).toUpperCase().replace(/[^A-Z0-9]+/g, "_") + "_API_KEY";
+}
+
+function registerCustomProviders() {
+  const list = Array.isArray(OVERRIDES.customProviders) ? OVERRIDES.customProviders : [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") continue;
+    const key = String(entry.key || "").trim();
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(key) || ENDPOINTS[key]) continue; // never shadow a built-in
+    let url;
+    try {
+      url = new URL(String(entry.baseUrl));
+    } catch {
+      console.error(`[proxy] custom provider "${key}": invalid baseUrl, skipped`);
+      continue;
+    }
+    const base = url.pathname.replace(/\/+$/, "");
+    ENDPOINTS[key] = {
+      label: String(entry.label || key),
+      host: url.hostname,
+      scheme: url.protocol === "http:" ? "http" : "https",
+      port: url.port ? Number(url.port) : undefined,
+      basePath: base + "/chat/completions",
+      apiKey: process.env[envKeyNameFor(key)] || entry.apiKey || null,
+      modelMap: {},
+      defaultModel: String(entry.defaultModel || ""),
+      type: "openai",
+      custom: true,
+    };
+    TEXT_PROVIDER_PRIORITY.push(key);
+    CATALOG_SOURCES[key] = {
+      sources: [
+        {
+          host: url.hostname,
+          scheme: ENDPOINTS[key].scheme,
+          port: ENDPOINTS[key].port,
+          path: base + "/models",
+        },
+      ],
+    };
+    CATALOGS[key] = { models: [], fetchedAt: 0, error: null };
+  }
+}
+registerCustomProviders();
+
+// The control panel can pin one provider instead of relying on key priority.
+// This runs after the custom ones are registered, so they can be pinned too.
+if (typeof OVERRIDES.provider === "string" && TEXT_PROVIDER_PRIORITY.includes(OVERRIDES.provider)) {
+  TEXT_PROVIDER_PRIORITY = [
+    OVERRIDES.provider,
+    ...TEXT_PROVIDER_PRIORITY.filter((k) => k !== OVERRIDES.provider),
+  ];
 }
 
 const DISCOVERY = OVERRIDES.discovery && typeof OVERRIDES.discovery === "object" ? OVERRIDES.discovery : {};
@@ -269,6 +360,17 @@ function isTextModel(id) {
   return !NON_TEXT_MODEL.test(s) && !DEPRECATED_MODEL.test(s);
 }
 
+// Custom providers can be plain http on localhost, so neither the module nor
+// the port can be assumed.
+function transportFor(ep) {
+  return ep.scheme === "http" ? http : https;
+}
+
+function portFor(ep) {
+  if (ep.port) return Number(ep.port);
+  return ep.scheme === "http" ? 80 : 443;
+}
+
 function claudeIdFor(upstreamModel) {
   const slug = String(upstreamModel).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   return "claude-" + slug;
@@ -316,19 +418,20 @@ function fetchModelList(provider, sourceIndex, cb) {
   const source = sources[sourceIndex];
   if (!source) return cb(new Error("no endpoint answered"), null);
 
-  const useQueryAuth = source.auth === "query";
+  const useQueryAuth = source.auth === "query" && Boolean(ep.apiKey);
   const reqPath = useQueryAuth
     ? source.path + (source.path.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(ep.apiKey)
     : source.path;
 
-  const req = https.request(
+  const transport = source.scheme === "http" ? http : https;
+  const req = transport.request(
     {
       hostname: source.host,
-      port: 443,
+      port: source.port || (source.scheme === "http" ? 80 : 443),
       path: reqPath,
       method: "GET",
       timeout: 15000,
-      headers: useQueryAuth
+      headers: useQueryAuth || !ep.apiKey
         ? { "User-Agent": "claude-desktop-proxy" }
         : {
             Authorization: "Bearer " + ep.apiKey,
@@ -344,7 +447,19 @@ function fetchModelList(provider, sourceIndex, cb) {
         try {
           const json = JSON.parse(d);
           models =
-            source.parse === "google"
+            source.parse === "openrouter"
+              ? // Keep the text-only models; the rest also emit images or audio.
+                (json.data || [])
+                  .filter((m) => {
+                    // Audio output means speech or music; image listed first
+                    // means an image generator. Image as a secondary output is
+                    // fine - that is what the openrouter/auto routers report.
+                    const out = (m.architecture && m.architecture.output_modalities) || ["text"];
+                    return out.includes("text") && !out.includes("audio") && out.indexOf("image") !== 0;
+                  })
+                  .map((m) => m.id)
+                  .filter(Boolean)
+              : source.parse === "google"
               ? // Google answers { models: [{ name: "models/x", supportedGenerationMethods }] }
                 (json.models || [])
                   .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
@@ -400,7 +515,7 @@ function refreshCatalog(provider, cb) {
   const state = CATALOGS[provider];
   const ep = ENDPOINTS[provider];
   if (!state || !ep) return done(null);
-  if (!ep.apiKey) {
+  if (!ep.apiKey && !ep.custom) {
     state.error = "no API key";
     return done(state);
   }
@@ -429,7 +544,7 @@ function refreshCatalogs() {
     if (!discoveryOn(provider)) continue;
     const ep = ENDPOINTS[provider];
     if (!ep) continue;
-    if (!ep.apiKey) {
+    if (!ep.apiKey && !ep.custom) {
       // Discovery is on but there is nothing to authenticate with; say so
       // instead of reporting an empty catalog with no reason.
       CATALOGS[provider].error = "no API key";
@@ -443,7 +558,7 @@ function refreshCatalogs() {
 // The text backend the user actually configured.
 function getPrimaryTextEndpoint() {
   for (const key of TEXT_PROVIDER_PRIORITY) {
-    if (ENDPOINTS[key].apiKey) return key;
+    if (providerReady(key)) return key;
   }
   return "deepseek"; // last-resort default if nothing is configured
 }
@@ -475,22 +590,43 @@ function resolveEndpoint(parsed) {
     }
   }
 
+  // A canonical id is a generic ask, so it belongs to the active provider even
+  // when that provider carries no static map of its own (a custom endpoint).
+  // A discovered id like claude-kimi-k3 still goes to whoever actually serves it.
+  const primaryKey = getPrimaryTextEndpoint();
+  const primaryEp = ENDPOINTS[primaryKey];
+  if (primaryEp && CANONICAL_IDS.has(origModel) && !primaryEp.modelMap[origModel]) {
+    const fallbackModel = primaryEp.defaultModel || (CATALOGS[primaryKey] && CATALOGS[primaryKey].models[0]);
+    if (fallbackModel) {
+      return {
+        key: primaryKey,
+        ep: primaryEp,
+        upstreamModel: fallbackModel,
+        directGemini: primaryKey === "gemini",
+      };
+    }
+  }
+
   // Route to whichever configured text provider is highest-priority for this model.
   for (const key of TEXT_PROVIDER_PRIORITY) {
     const ep = ENDPOINTS[key];
-    if (!ep.apiKey) continue;
+    if (!providerReady(key)) continue;
     if (ep.modelMap && ep.modelMap[origModel]) {
       return { key, ep, upstreamModel: ep.modelMap[origModel], directGemini: key === "gemini" };
     }
   }
   // Unknown model id: fall back to whichever text provider is actually configured,
   // instead of always DeepSeek (which may have no API key set).
+  // Unknown id: hand it to whichever provider is active. A custom endpoint has
+  // no built-in default, so fall back to the first model it reported.
   const fallbackKey = getPrimaryTextEndpoint();
   const fallbackEp = ENDPOINTS[fallbackKey];
+  const catalog = CATALOGS[fallbackKey];
+  const fallbackModel = fallbackEp.defaultModel || (catalog && catalog.models[0]) || "";
   return {
     key: fallbackKey,
     ep: fallbackEp,
-    upstreamModel: fallbackEp.defaultModel,
+    upstreamModel: fallbackModel,
     directGemini: fallbackKey === "gemini",
   };
 }
@@ -928,24 +1064,37 @@ function sendOpenCodeRequest(ep, parsed, req, res, origModel) {
   // answers "Model … is not supported" for it.
   const upstreamPath = (ep.modelBase && ep.modelBase[parsed.model]) || ep.basePath;
 
+  const headers = {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(newBody),
+  };
+  // Security: never forward a client-supplied key; only the configured one.
+  // A local model server usually has none at all.
+  if (ep.apiKey) headers["Authorization"] = "Bearer " + ep.apiKey;
+  if (ep.key === "opencode" || ep.type === "opencode") {
+    headers["x-opencode-session"] = getOpenCodeSessionId(parsed, req);
+  }
+  if (ep.host === "openrouter.ai") {
+    // Optional attribution headers OpenRouter uses for its rankings.
+    headers["HTTP-Referer"] = "https://github.com/Grekto-dev/patchbay";
+    headers["X-Title"] = "Patchbay";
+  }
+
   const options = {
     hostname: ep.host,
-    port: 443,
+    port: portFor(ep),
     path: upstreamPath,
     method: "POST",
-    // Security: Do not forward client-supplied API key; use only configured key
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(newBody),
-      "x-opencode-session": getOpenCodeSessionId(parsed, req),
-      "Authorization": "Bearer " + (ep.apiKey || ""),
-    },
+    headers,
   };
 
-  console.log(`[proxy] [OPENCODE] model: ${parsed.model} (from ${origModel})`);
-  console.log(`[proxy] [OPENCODE] → POST https://${ep.host}${upstreamPath} (${newBody.length} bytes, stream=${!!parsed.stream})`);
+  const tag = ep.custom ? ep.label.toUpperCase() : ep.key === "openrouter" ? "OPENROUTER" : "OPENCODE";
+  const scheme = ep.scheme === "http" ? "http" : "https";
+  const hostPort = ep.port ? ep.host + ":" + ep.port : ep.host;
+  console.log(`[proxy] [${tag}] model: ${parsed.model} (from ${origModel})`);
+  console.log(`[proxy] [${tag}] → POST ${scheme}://${hostPort}${upstreamPath} (${newBody.length} bytes, stream=${!!parsed.stream})`);
 
-  const upstream = https.request(options, (upstreamRes) => {
+  const upstream = transportFor(ep).request(options, (upstreamRes) => {
     const isSSE = (upstreamRes.headers["content-type"] || "").includes("text/event-stream");
 
     if (upstreamRes.statusCode >= 400) {
@@ -959,7 +1108,7 @@ function sendOpenCodeRequest(ep, parsed, req, res, origModel) {
             // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
           });
         }
-        res.end(JSON.stringify({ type: "error", error: { message: `opencode API ${upstreamRes.statusCode}` } }));
+        res.end(JSON.stringify({ type: "error", error: { message: `${ep.label} API ${upstreamRes.statusCode}` } }));
       });
       return;
     }
@@ -1367,6 +1516,21 @@ function handleRequest(req, res) {
       return res.end(JSON.stringify(probeResp));
     }
 
+    if (!upstreamModel) {
+      console.error(`[proxy] no model available on ${ep.label} for ${origModel}`);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(
+        JSON.stringify({
+          type: "error",
+          error: {
+            message:
+              `No model on ${ep.label} matches "${origModel}". Turn discovery on for it, ` +
+              `or map the id in proxy-config.json.`,
+          },
+        })
+      );
+    }
+
     // ── Gemini as the text backend (also multimodal) ──
     if (directGemini) {
       console.log(`[proxy] model map: ${origModel} → ${upstreamModel} (Google AI Studio)`);
@@ -1383,8 +1547,8 @@ function handleRequest(req, res) {
       return;
     }
 
-    // ── Route to OpenCode (OpenAI format) ──────────
-    if (ep.type === "opencode") {
+    // ── Route to any OpenAI-compatible provider ────
+    if (ep.type === "opencode" || ep.type === "openai") {
       parsed.model = upstreamModel;
       if (!parsed.max_tokens || parsed.max_tokens < 1024) parsed.max_tokens = 8192;
       sendOpenCodeRequest(ep, parsed, req, res, origModel);
@@ -1479,7 +1643,8 @@ server.listen(PROXY_PORT, "127.0.0.1", () => {
     const activeEp = ENDPOINTS[activeKey];
     console.log(`\n  Claude → Multi-Backend Proxy (HTTPS)`);
     console.log(`  Listening:    https://127.0.0.1:${PROXY_PORT}`);
-    console.log(`  Text backend: ${activeEp.label}${activeEp.apiKey ? "" : "  ⚠ no API key configured!"}`);
+    const keyNote = activeEp.apiKey || activeEp.custom ? "" : "  ⚠ no API key configured!";
+    console.log(`  Text backend: ${activeEp.label}${keyNote}`);
     console.log(`  Gemini Flash: auto image/OCR routing`);
     const discovering = Object.keys(CATALOG_SOURCES).filter(discoveryOn);
     if (discovering.length) {

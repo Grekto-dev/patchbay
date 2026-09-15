@@ -85,13 +85,53 @@
     <div class="card">
       <h2>Text provider</h2>
       <p class="hint">
-        With more than one key configured the proxy follows the priority OpenCode&nbsp;Go → GLM →
-        DeepSeek → Google&nbsp;AI&nbsp;Studio. Pin a provider here to override that order. Images go to
-        Google either way — straight to it when it is the text backend, through OCR otherwise.
+        With more than one key configured the proxy follows the priority OpenCode&nbsp;Go →
+        OpenRouter → GLM → DeepSeek → Google&nbsp;AI&nbsp;Studio, with custom providers last. Pin one
+        here to override that order. Images go to Google either way — straight to it when it is the
+        text backend, through OCR otherwise.
       </p>
       <div class="provider-list" id="provider-list"></div>
       <div class="actions" style="margin-top:14px">
         <button class="primary" id="btn-save-provider">Save provider</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Custom providers</h2>
+          <p class="hint">
+            Anything that speaks the OpenAI API — Ollama, LM Studio, vLLM, llama.cpp, a company
+            gateway. Point it at the base that holds <code class="inline-code">/chat/completions</code>
+            and <code class="inline-code">/models</code>, usually ending in
+            <code class="inline-code">/v1</code>. A local server needs no key; leave it empty.
+          </p>
+        </div>
+      </div>
+      <div class="rows" id="custom-list"></div>
+      <div class="grid two" style="margin-top:14px">
+        <label class="field">
+          <span class="lab">Id<small>lowercase, no spaces</small></span>
+          <input type="text" id="cp-key" placeholder="ollama" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="lab">Name</span>
+          <input type="text" id="cp-label" placeholder="Ollama (local)" autocomplete="off">
+        </label>
+      </div>
+      <div class="grid two">
+        <label class="field">
+          <span class="lab">Base URL</span>
+          <input type="text" id="cp-url" placeholder="http://127.0.0.1:11434/v1" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="lab">API key<small>optional</small></span>
+          <input type="password" id="cp-token" placeholder="leave empty for a local server" autocomplete="off">
+        </label>
+      </div>
+      <div class="actions">
+        <button class="primary" id="btn-add-provider">Add provider</button>
+        <span class="hint" style="margin:0">Known bases: Ollama <code class="inline-code">:11434/v1</code> · LM Studio <code class="inline-code">:1234/v1</code></span>
       </div>
     </div>
 

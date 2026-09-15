@@ -7,8 +7,9 @@
 **A local gateway that lets Claude Desktop run on other models.**
 
 Point the app at a proxy on your own machine and its model picker fills up with
-OpenCode Go, DeepSeek, GLM and Google AI Studio models — including free ones —
-while the interface, the tools and the workflow stay exactly as they are.
+OpenCode Go, OpenRouter, DeepSeek, GLM, Google AI Studio and anything you run
+locally — including free models — while the interface, the tools and the
+workflow stay exactly as they are.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Node 18+](https://img.shields.io/badge/node-%E2%89%A518-5fa04e)
@@ -27,15 +28,15 @@ Anthropic-format requests, translates them, and forwards them to whichever
 provider you configured.
 
 ```
-                                   ┌─→ OpenCode Go       text · 45 models, 8 of them free
+                                   ┌─→ OpenCode Go       45 models, 8 of them free
 Claude Desktop                     │
-      │  HTTPS                     ├─→ DeepSeek          text
+      │  HTTPS                     ├─→ OpenRouter        432 models, 20 free
       ▼                            │
-https://127.0.0.1:8877  ──────────►├─→ GLM (Z.ai)        text
+https://127.0.0.1:8877  ──────────►├─→ DeepSeek · GLM (Z.ai)
    Patchbay proxy                  │
-      ▲                            └─→ Google AI Studio  text + images
-      │
-http://127.0.0.1:8878
+      ▲                            ├─→ Google AI Studio  text + images
+      │                            │
+http://127.0.0.1:8878              └─→ your own endpoint  Ollama · LM Studio · vLLM · …
    Patchbay panel  ── start/stop · keys · models · live logs · diagnostics
 ```
 
@@ -50,8 +51,11 @@ directly when it is also the text backend, through an OCR hand-off otherwise.
 - **Live model catalogs.** Each provider is asked what it currently serves, and
   every model is published as a `claude-…` id that Claude Desktop accepts. No
   hand-maintained lists that rot the week a provider renames something.
-- **Free models surfaced.** OpenCode's free tier is discovered and labelled,
-  with the cost of every other model shown next to it.
+- **Free models surfaced.** The free tiers on OpenCode and OpenRouter are
+  discovered and labelled, with the cost of every other model next to it.
+- **Bring your own endpoint.** Anything that speaks the OpenAI API — Ollama,
+  LM Studio, vLLM, llama.cpp, a company gateway — is added from the panel, over
+  plain http on localhost if that is where it lives, with no key required.
 - **Zero dependencies.** Node's standard library only — no `npm install`, no
   lockfile to audit, nothing to keep patched.
 - **Local by construction.** Both servers bind to `127.0.0.1`, no CORS headers
@@ -65,7 +69,7 @@ directly when it is also the text backend, through an OCR hand-off otherwise.
 |---|---|
 | **Node.js 18+** | `node --version`. The setup scripts install it on Windows via winget if missing. |
 | **Claude Desktop** | Already installed and updated. |
-| **A text provider key** | [OpenCode Go](https://opencode.ai) · [DeepSeek](https://platform.deepseek.com) · [GLM / Z.ai](https://z.ai) · [Google AI Studio](https://aistudio.google.com/apikey) — one of them is enough; configure several and switch in the panel. |
+| **A text provider** | A key for [OpenCode Go](https://opencode.ai) · [OpenRouter](https://openrouter.ai/keys) · [DeepSeek](https://platform.deepseek.com) · [GLM / Z.ai](https://z.ai) · [Google AI Studio](https://aistudio.google.com/apikey), **or** a local server such as Ollama or LM Studio, which needs no key at all. One of them is enough; configure several and switch in the panel. |
 | **A Google AI Studio key** | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free tier, no card. It handles images whichever provider answers the text, so it is worth having even when it is not your text backend. |
 
 ---
@@ -209,25 +213,35 @@ startup and every 30 minutes, then publishes each model as `claude-<slug>`:
 | OpenCode | `/zen/go/v1/models` **and** `/zen/v1/models` on `opencode.ai`, merged |
 | DeepSeek | `https://api.deepseek.com/models` |
 | GLM (Z.ai) | `https://api.z.ai/api/coding/paas/v4/models`, falling back to `/api/paas/v4/models` |
+| OpenRouter | `https://openrouter.ai/api/v1/models` |
 | Google AI Studio | `https://generativelanguage.googleapis.com/v1beta/models` |
+| Custom provider | `<your base URL>/models` |
 
 Discovery is optional. With it off, the static maps in `proxy/server.js` apply:
 
-| Claude Desktop id | OpenCode Go | DeepSeek | GLM | Google |
-|---|---|---|---|---|
-| `claude-sonnet-4-5` / `-4-6` | `deepseek-v4-flash` | `deepseek-v4-flash` | `glm-5-turbo` | `gemini-3.6-flash` |
-| `claude-opus-4-7` | `deepseek-v4-flash` | `deepseek-v4-pro` | `glm-5.2` | `gemini-3.8-flash` |
-| `claude-haiku-4-5-20251001` | `deepseek-v4-flash` | `deepseek-v4-flash` | `glm-4.5-air` | `gemini-3.1-flash-lite` |
+| Claude Desktop id | OpenCode Go | OpenRouter | DeepSeek | GLM | Google |
+|---|---|---|---|---|---|
+| `claude-sonnet-4-5` / `-4-6` | `deepseek-v4-flash` | `openrouter/auto` | `deepseek-v4-flash` | `glm-5-turbo` | `gemini-3.6-flash` |
+| `claude-opus-4-7` | `deepseek-v4-flash` | `openrouter/auto` | `deepseek-v4-pro` | `glm-5.2` | `gemini-3.8-flash` |
+| `claude-haiku-4-5-20251001` | `deepseek-v4-flash` | `openrouter/free` | `deepseek-v4-flash` | `glm-4.5-air` | `gemini-3.1-flash-lite` |
+
+A custom provider ships no static map: turn discovery on, or map its ids by
+hand in `proxy-config.json`.
 
 Provider lineups move fast — the GLM ids above are inherited from upstream and
 may already be gone. Turning discovery on is the maintenance-free option.
 
 ### Free models
 
-The provider APIs return ids and nothing else: no price, no free flag. Costs
-come from [models.dev](https://models.dev), the model database OpenCode itself
-maintains, where a model counts as free when input and output both cost 0. Free
-models get a `free` tag; everything else shows `$in / $out` per million tokens.
+Most provider APIs return ids and nothing else: no price, no free flag. Costs
+then come from [models.dev](https://models.dev), the model database OpenCode
+itself maintains, where a model counts as free when input and output both cost
+0. **OpenRouter is the exception** — it reports pricing and modalities in its
+own `/models` response, so its numbers come straight from the source and its
+catalog keeps the text models without outside help — 432 of the 445 it lists,
+dropping the ones that answer in audio (Lyria, gpt-audio) or whose primary
+output is an image. Free models get a `free` tag; everything else shows `$in / $out` per
+million tokens.
 
 OpenCode is a special case: one key reaches **two** surfaces with different
 models, and the free ones only exist on the non-Go surface. Patchbay merges the
@@ -242,6 +256,62 @@ Hover an id in the Models tab and click the pencil to rename it. The `claude-`
 prefix is fixed, the rest is slugified, and an id already used by another model
 is refused. Uncheck models you do not want in the picker; with everything
 checked, no list is written and the whole catalog applies.
+
+---
+
+## OpenRouter
+
+Add `OPENROUTER_API_KEY` on the Keys tab and turn discovery on: 432 text models
+in one catalog, priced by the request, with about twenty of them free. The
+static map uses OpenRouter's own routers rather than pinning a vendor model —
+`openrouter/auto` picks per request and `openrouter/free` stays on the zero-cost
+pool — so the defaults keep working as the catalog changes underneath.
+
+Requests carry the optional `HTTP-Referer` and `X-Title` headers OpenRouter uses
+for its public rankings.
+
+---
+
+## Custom providers: Ollama, LM Studio, and anything OpenAI-compatible
+
+If it serves `POST /chat/completions` and `GET /models` in the OpenAI shape,
+Patchbay can use it. Add it under **Keys & provider → Custom providers**:
+
+| Field | Example |
+|---|---|
+| Id | `ollama` — lowercase, used in the config and in the log |
+| Name | `Ollama (local)` — what the panel shows |
+| Base URL | `http://127.0.0.1:11434/v1` — the base that holds `/chat/completions` and `/models` |
+| API key | usually empty for a local server |
+
+Common bases: **Ollama** `http://127.0.0.1:11434/v1`, **LM Studio**
+`http://127.0.0.1:1234/v1`, **vLLM** `http://127.0.0.1:8000/v1`,
+**llama.cpp server** `http://127.0.0.1:8080/v1`.
+
+Saved entries land in `proxy-config.json`:
+
+```json
+{
+  "customProviders": [
+    { "key": "ollama", "label": "Ollama (local)", "baseUrl": "http://127.0.0.1:11434/v1" }
+  ]
+}
+```
+
+Notes worth knowing:
+
+- **Plain http is fine.** Local endpoints are reached over http on their own
+  port; only the gateway Claude Desktop talks to needs TLS.
+- **No key, no problem.** A provider without credentials is still selectable and
+  discoverable — "configured" does not mean "has a key". When one is needed it
+  goes to `.env` as `PATCHBAY_<ID>_API_KEY`, alongside every other secret.
+- **Last in priority.** Custom providers sit after the built-ins, so adding one
+  never silently takes over from a configured cloud provider. Pin it in the
+  panel to make it answer.
+- **Discovery is the practical path.** There is no built-in model map for an
+  endpoint whose models only you know about.
+- **Removing one cleans up after itself** — its entry, its key and any model
+  selection or pin that referenced it.
 
 ---
 
@@ -300,14 +370,16 @@ Written by the setup script or the panel; one key per provider.
 
 ```env
 OPENCODE_API_KEY=...     # https://opencode.ai
+OPENROUTER_API_KEY=...   # https://openrouter.ai/keys
 GLM_API_KEY=...          # https://z.ai
 DEEPSEEK_API_KEY=...     # https://platform.deepseek.com
 GEMINI_API_KEY=...       # https://aistudio.google.com/apikey
+PATCHBAY_OLLAMA_API_KEY= # only if that custom provider needs one
 ```
 
-With more than one configured, priority is
-**OpenCode Go → GLM → DeepSeek → Google AI Studio**. Pinning a provider in the
-panel overrides that order.
+With more than one configured, priority is **OpenCode Go → OpenRouter → GLM →
+DeepSeek → Google AI Studio**, and custom providers come after those. Pinning a
+provider in the panel overrides the order.
 
 ### `proxy-config.json`
 
@@ -331,7 +403,10 @@ Delete it to return to the built-in defaults. Nothing here rewrites
   },
   "models": {                         // hand-written entries; these win over discovery
     "glm": { "claude-sonnet-4-5": "glm-5.3" }
-  }
+  },
+  "customProviders": [                // OpenAI-compatible endpoints of your own
+    { "key": "ollama", "label": "Ollama (local)", "baseUrl": "http://127.0.0.1:11434/v1" }
+  ]
 }
 ```
 
@@ -413,6 +488,9 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 | Image upload returns 503 | Use drag & drop or the `+` button; the Quick Entry shortcut bypasses the gateway. |
 | Panel says the port is in use | It is already open in another window, or something else holds 8878. `UI_PORT=8879 node ui/server.js`. |
 | Live logs stay empty | The proxy was started outside the panel. Stop it and start it from the panel. |
+| Custom provider shows 0 models | Its `/models` endpoint did not answer. Check the base URL (it usually ends in `/v1`), that the server is running, and that the path has no trailing slash surprises. |
+| Custom provider answers 404 on chat | The base URL points one level too deep or too shallow: Patchbay appends `/chat/completions` to it. |
+| OpenRouter returns 401 | The key is missing or wrong — its catalog is public, so models can list while requests still fail. |
 
 The **Diagnostics** tab runs `proxy/test-proxy.js` against the running proxy and
 prints a health check, a probe test and a malformed-payload test.
@@ -423,6 +501,9 @@ prints a health check, a probe test and a malformed-payload test.
 
 - **One text backend at a time.** Providers are not load-balanced or failed
   over; the pinned one (or the first configured by priority) answers everything.
+- **Custom providers are trusted as given.** Patchbay does not probe whether an
+  endpoint really is OpenAI-compatible; if it is not, the error comes back from
+  the request itself.
 - **Free-tier labels depend on models.dev.** If it is unreachable, the panel
   shows no cost data and the proxy falls back to matching `-free` in the model
   name — which misses free models named otherwise, such as `big-pickle`.
