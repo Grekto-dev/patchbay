@@ -3,7 +3,7 @@ const https = require("https");
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const HOST = "localhost";
-const PORT = 8877;
+const PORT = Number(process.env.PROXY_PORT) > 0 ? Number(process.env.PROXY_PORT) : 8877;
 const PASS = process.env.PASS === "1";
 
 function post(path, body) {

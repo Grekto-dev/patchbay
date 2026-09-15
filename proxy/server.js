@@ -13,9 +13,23 @@ if (fs.existsSync(envPath)) {
   });
 }
 
-// ── Proxy Port ───────────────────────────────────────────
-const PROXY_PORT = 8877;
 const DIR = path.join(__dirname, "..");
+
+// ── Optional overrides written by the control panel (ui/) ─
+// proxy-config.json is optional; when absent everything below
+// falls back to the built-in defaults.
+function loadOverrides() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(DIR, "proxy-config.json"), "utf8"));
+    return cfg && typeof cfg === "object" ? cfg : {};
+  } catch {
+    return {};
+  }
+}
+const OVERRIDES = loadOverrides();
+
+// ── Proxy Port ───────────────────────────────────────────
+const PROXY_PORT = Number(OVERRIDES.port) > 0 ? Number(OVERRIDES.port) : 8877;
 
 // ── Endpoint Config ──────────────────────────────────────
 const ENDPOINTS = {
@@ -34,11 +48,24 @@ const ENDPOINTS = {
     type: "anthropic",
   },
   gemini: {
-    label: "Gemini Flash",
+    label: "Google AI Studio",
     host: "generativelanguage.googleapis.com",
     basePath: "/v1beta/models",
     apiKey: process.env.GEMINI_API_KEY || null,
-    model: "gemini-2.5-flash",
+    // Used by the image pipeline when another provider handles the text.
+    // (gemini-2.5-flash now 404s for new keys; Google points at 3.6.)
+    model: "gemini-3.6-flash",
+    // Concrete ids, not the "-latest" aliases: those currently resolve to
+    // thinking models that spend the whole budget before answering. Pro
+    // models are omitted because they are 429 on the free AI Studio tier -
+    // discovery adds every id, so pick one there if your key has the quota.
+    modelMap: {
+      "claude-sonnet-4-5": "gemini-3.6-flash",
+      "claude-sonnet-4-6": "gemini-3.6-flash",
+      "claude-opus-4-7": "gemini-3.8-flash",
+      "claude-haiku-4-5-20251001": "gemini-3.1-flash-lite",
+    },
+    defaultModel: "gemini-3.6-flash",
     type: "gemini",
   },
   opencode: {
@@ -70,13 +97,348 @@ const ENDPOINTS = {
     type: "anthropic",
   },
 };
+
+// Model-map overrides from proxy-config.json:
+//   { "models": { "glm": { "claude-sonnet-4-5": "glm-5.2" } } }
+if (OVERRIDES.models && typeof OVERRIDES.models === "object") {
+  for (const [epKey, map] of Object.entries(OVERRIDES.models)) {
+    const ep = ENDPOINTS[epKey];
+    if (!ep || !ep.modelMap || !map || typeof map !== "object") continue;
+    for (const [cModel, uModel] of Object.entries(map)) {
+      if (typeof uModel === "string" && uModel.trim()) ep.modelMap[cModel] = uModel.trim();
+    }
+  }
+}
 // ─────────────────────────────────────────────────────────
 
 // Mutually exclusive text providers, in priority order when more than one
 // key happens to be configured. GLM and DeepSeek both speak the proxy's
 // native Anthropic-style format (type: "anthropic"); OpenCode Go needs the
 // OpenAI-format conversion (type: "opencode").
-const TEXT_PROVIDER_PRIORITY = ["opencode", "glm", "deepseek"];
+// Gemini sits last: its key is usually present for images alone, so it should
+// only take over the text when nothing else is configured - or when pinned.
+let TEXT_PROVIDER_PRIORITY = ["opencode", "glm", "deepseek", "gemini"];
+
+// The control panel can pin one provider instead of relying on key priority.
+if (typeof OVERRIDES.provider === "string" && TEXT_PROVIDER_PRIORITY.includes(OVERRIDES.provider)) {
+  TEXT_PROVIDER_PRIORITY = [
+    OVERRIDES.provider,
+    ...TEXT_PROVIDER_PRIORITY.filter((k) => k !== OVERRIDES.provider),
+  ];
+}
+
+// ── Live provider catalogs ───────────────────────────
+// Every text provider publishes an OpenAI-style model list. With
+// `discovery: { "<provider>": true }` in proxy-config.json the proxy pulls that
+// list and exposes each model as a `claude-…` id, which is all Claude Desktop
+// requires - so the lineup follows the provider instead of a hand-written map.
+// `merge: true` means every source is queried and the results combined (the
+// same OpenCode key serves two surfaces with different models); otherwise the
+// sources are fallbacks and the first one that answers wins. `chatPath` is
+// where completions for that surface go, when it differs from ep.basePath.
+const CATALOG_SOURCES = {
+  opencode: {
+    merge: true,
+    sources: [
+      { host: "opencode.ai", path: "/zen/go/v1/models", chatPath: "/zen/go/v1/chat/completions" },
+      // The non-Go surface only contributes its free models: anything paid
+      // there is already covered by the Go plan.
+      { host: "opencode.ai", path: "/zen/v1/models", chatPath: "/zen/v1/chat/completions", freeOnly: true },
+    ],
+  },
+  deepseek: { sources: [{ host: "api.deepseek.com", path: "/models" }] },
+  gemini: {
+    sources: [
+      {
+        host: "generativelanguage.googleapis.com",
+        path: "/v1beta/models?pageSize=200",
+        auth: "query",
+        parse: "google",
+      },
+    ],
+  },
+  // Coding Plan keys and general keys live on different bases; try both.
+  glm: {
+    sources: [
+      { host: "api.z.ai", path: "/api/coding/paas/v4/models" },
+      { host: "api.z.ai", path: "/api/paas/v4/models" },
+    ],
+  },
+};
+const CATALOG_TTL_MS = 30 * 60 * 1000;
+
+const CATALOGS = {};
+for (const key of Object.keys(CATALOG_SOURCES)) {
+  CATALOGS[key] = { models: [], fetchedAt: 0, error: null };
+}
+
+const DISCOVERY = OVERRIDES.discovery && typeof OVERRIDES.discovery === "object" ? OVERRIDES.discovery : {};
+const CATALOG_ENABLED = OVERRIDES.catalogEnabled && typeof OVERRIDES.catalogEnabled === "object" ? OVERRIDES.catalogEnabled : {};
+const CATALOG_IDS = OVERRIDES.catalogIds && typeof OVERRIDES.catalogIds === "object" ? OVERRIDES.catalogIds : {};
+
+function discoveryOn(provider) {
+  return DISCOVERY[provider] === true;
+}
+
+function anyDiscoveryOn() {
+  return Object.keys(CATALOG_SOURCES).some(discoveryOn);
+}
+
+// Which models are free. The provider APIs do not say, so this comes from
+// models.dev (OpenCode's own model database): free means input and output both
+// cost 0. Only needed for sources marked `freeOnly`.
+const FREE_PRICING_SOURCES = { opencode: ["opencode-go", "opencode"] };
+const FREE_TTL_MS = 12 * 60 * 60 * 1000;
+const freeModels = { byProvider: {}, fetchedAt: 0, ok: false };
+
+function needsFreeData() {
+  return Object.entries(CATALOG_SOURCES).some(
+    ([provider, spec]) => discoveryOn(provider) && (spec.sources || []).some((src) => src.freeOnly)
+  );
+}
+
+function refreshFreeModels(cb) {
+  const done = cb || (() => {});
+  if (freeModels.fetchedAt && Date.now() - freeModels.fetchedAt < FREE_TTL_MS) return done();
+
+  const req = https.request(
+    { hostname: "models.dev", port: 443, path: "/api.json", method: "GET", timeout: 25000, headers: { "User-Agent": "claude-desktop-proxy" } },
+    (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        try {
+          const db = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          const byProvider = {};
+          for (const [provider, sources] of Object.entries(FREE_PRICING_SOURCES)) {
+            const free = new Set();
+            for (const source of sources) {
+              const models = (db[source] && db[source].models) || {};
+              for (const [id, m] of Object.entries(models)) {
+                const cost = m.cost || {};
+                if (Number(cost.input) === 0 && Number(cost.output) === 0) free.add(id);
+              }
+            }
+            byProvider[provider] = free;
+          }
+          freeModels.byProvider = byProvider;
+          freeModels.fetchedAt = Date.now();
+          freeModels.ok = true;
+          console.log(`[proxy] [CATALOG] models.dev: free models known (${Object.values(byProvider).reduce((n, s) => n + s.size, 0)})`);
+        } catch (e) {
+          freeModels.ok = false;
+          console.error("[proxy] [CATALOG] models.dev unusable, falling back to the -free suffix:", e.message);
+        }
+        done();
+      });
+    }
+  );
+  req.on("error", (e) => {
+    freeModels.ok = false;
+    console.error("[proxy] [CATALOG] models.dev unreachable, falling back to the -free suffix:", e.message);
+    done();
+  });
+  req.on("timeout", () => {
+    req.destroy();
+    freeModels.ok = false;
+    done();
+  });
+  req.end();
+}
+
+// With models.dev unavailable, the naming convention is the best guess left.
+function isFreeModel(provider, model) {
+  const set = freeModels.byProvider[provider];
+  if (freeModels.ok && set) return set.has(model);
+  return /-free$/.test(model);
+}
+
+// Google lists image, music, speech and agent-only models next to the chat
+// ones, all of them under generateContent, with no modality field to tell them
+// apart - so they are excluded by name. Several are not even usable this way:
+// antigravity-* and deep-research-* answer "This model only supports
+// Interactions API", and lyria/nano-banana return audio or images.
+const NON_TEXT_MODEL = /(^|[-.])(image|images|tts|transcribe|robotics|omni|embedding|imagen|veo|aqa)([-.]|$)|nano-banana|lyria|computer-use|antigravity|deep-research/i;
+
+// Retired by Google but still advertised by the API, with no deprecation flag
+// to go by: the whole 2.5 family answers 404 "no longer available to new users".
+const DEPRECATED_MODEL = /^gemini-2\.5-/i;
+
+function isTextModel(id) {
+  const s = String(id);
+  return !NON_TEXT_MODEL.test(s) && !DEPRECATED_MODEL.test(s);
+}
+
+function claudeIdFor(upstreamModel) {
+  const slug = String(upstreamModel).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return "claude-" + slug;
+}
+
+// Ids written by hand in proxy-config.json must survive a catalog refresh.
+function pinnedIdsFor(provider) {
+  return new Set(Object.keys((OVERRIDES.models && OVERRIDES.models[provider]) || {}));
+}
+
+function applyCatalog(provider, models, chatPaths) {
+  const ep = ENDPOINTS[provider];
+  if (!ep || !ep.modelMap) return 0;
+  // Per-model completions path, for providers whose catalog spans more than
+  // one base (see sendOpenCodeRequest).
+  ep.modelBase = ep.modelBase || {};
+  for (const [model, chatPath] of Object.entries(chatPaths || {})) {
+    if (chatPath) ep.modelBase[model] = chatPath;
+  }
+  const allow = Array.isArray(CATALOG_ENABLED[provider]) ? new Set(CATALOG_ENABLED[provider]) : null;
+  const renamed = CATALOG_IDS[provider] && typeof CATALOG_IDS[provider] === "object" ? CATALOG_IDS[provider] : {};
+  const pinned = pinnedIdsFor(provider);
+  const taken = new Map(); // claude id → upstream model
+  let added = 0;
+
+  for (const model of models) {
+    if (allow && !allow.has(model)) continue;
+    const custom = typeof renamed[model] === "string" && /^claude-/.test(renamed[model]) ? renamed[model] : null;
+    let id = custom || claudeIdFor(model);
+    if (pinned.has(id)) continue; // an explicit map entry wins
+    const base = id;
+    let n = 2;
+    while (taken.has(id) && taken.get(id) !== model) id = base + "-" + n++;
+    taken.set(id, model);
+    if (ep.modelMap[id] !== model) added++;
+    ep.modelMap[id] = model;
+  }
+  return added;
+}
+
+function fetchModelList(provider, sourceIndex, cb) {
+  const ep = ENDPOINTS[provider];
+  const spec = CATALOG_SOURCES[provider] || { sources: [] };
+  const sources = spec.sources;
+  const source = sources[sourceIndex];
+  if (!source) return cb(new Error("no endpoint answered"), null);
+
+  const useQueryAuth = source.auth === "query";
+  const reqPath = useQueryAuth
+    ? source.path + (source.path.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(ep.apiKey)
+    : source.path;
+
+  const req = https.request(
+    {
+      hostname: source.host,
+      port: 443,
+      path: reqPath,
+      method: "GET",
+      timeout: 15000,
+      headers: useQueryAuth
+        ? { "User-Agent": "claude-desktop-proxy" }
+        : {
+            Authorization: "Bearer " + ep.apiKey,
+            "x-api-key": ep.apiKey,
+            "User-Agent": "claude-desktop-proxy",
+          },
+    },
+    (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => {
+        let models = null;
+        try {
+          const json = JSON.parse(d);
+          models =
+            source.parse === "google"
+              ? // Google answers { models: [{ name: "models/x", supportedGenerationMethods }] }
+                (json.models || [])
+                  .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
+                  .map((m) => String(m.name || "").replace(/^models\//, ""))
+                  .filter((id) => id && isTextModel(id))
+              : (json.data || []).map((m) => m.id).filter(Boolean);
+        } catch {
+          models = null;
+        }
+        if (models && models.length) {
+          if (source.freeOnly) models = models.filter((m) => isFreeModel(provider, m));
+          const chatPaths = {};
+          for (const m of models) chatPaths[m] = source.chatPath || null;
+          if (spec.merge && sourceIndex + 1 < sources.length) {
+            // Combine the surfaces instead of stopping at the first one.
+            return fetchModelList(provider, sourceIndex + 1, (err2, more, morePaths) => {
+              if (err2 || !more) return cb(null, models, chatPaths);
+              const seen = new Set(models);
+              const all = [...models];
+              for (const m of more) {
+                if (seen.has(m)) continue;
+                seen.add(m);
+                all.push(m);
+                chatPaths[m] = (morePaths && morePaths[m]) || null;
+              }
+              cb(null, all, chatPaths);
+            });
+          }
+          return cb(null, models, chatPaths);
+        }
+        // A free-only source can legitimately come back empty after filtering.
+        if (source.freeOnly && models) return cb(null, [], {});
+        // Try the next base before giving up (Z.ai coding vs general plan).
+        if (sourceIndex + 1 < sources.length) return fetchModelList(provider, sourceIndex + 1, cb);
+        cb(new Error("HTTP " + res.statusCode + ": " + d.slice(0, 120)), null);
+      });
+    }
+  );
+  req.on("error", (e) => {
+    if (sourceIndex + 1 < sources.length) return fetchModelList(provider, sourceIndex + 1, cb);
+    cb(e, null);
+  });
+  req.on("timeout", () => {
+    req.destroy();
+    if (sourceIndex + 1 < sources.length) return fetchModelList(provider, sourceIndex + 1, cb);
+    cb(new Error("timeout"), null);
+  });
+  req.end();
+}
+
+function refreshCatalog(provider, cb) {
+  const done = cb || (() => {});
+  const state = CATALOGS[provider];
+  const ep = ENDPOINTS[provider];
+  if (!state || !ep) return done(null);
+  if (!ep.apiKey) {
+    state.error = "no API key";
+    return done(state);
+  }
+  fetchModelList(provider, 0, (err, models, chatPaths) => {
+    if (err) {
+      state.error = err.message;
+      console.error(`[proxy] [CATALOG] ${ep.label}: failed — ${err.message}`);
+      return done(state);
+    }
+    state.models = models;
+    state.fetchedAt = Date.now();
+    state.error = null;
+    const added = applyCatalog(provider, models, chatPaths);
+    console.log(`[proxy] [CATALOG] ${ep.label}: ${models.length} models (${added} new claude-* ids)`);
+    done(state);
+  });
+}
+
+function refreshAllCatalogs() {
+  if (needsFreeData()) return refreshFreeModels(() => refreshCatalogs());
+  refreshCatalogs();
+}
+
+function refreshCatalogs() {
+  for (const provider of Object.keys(CATALOG_SOURCES)) {
+    if (!discoveryOn(provider)) continue;
+    const ep = ENDPOINTS[provider];
+    if (!ep) continue;
+    if (!ep.apiKey) {
+      // Discovery is on but there is nothing to authenticate with; say so
+      // instead of reporting an empty catalog with no reason.
+      CATALOGS[provider].error = "no API key";
+      continue;
+    }
+    refreshCatalog(provider);
+  }
+}
+
 
 // The text backend the user actually configured.
 function getPrimaryTextEndpoint() {
@@ -101,8 +463,15 @@ function resolveEndpoint(parsed) {
   const messages = parsed.messages || [];
   for (const msg of messages) {
     if (Array.isArray(msg.content) && msg.content.some((c) => c.type === "image")) {
+      const ep = ENDPOINTS.gemini;
+      // When Gemini is already the text backend there is nothing to hand off
+      // to: send the images to it directly instead of OCR-ing them first.
+      if (getPrimaryTextEndpoint() === "gemini") {
+        console.log(`[proxy] [IMAGE] image detected → Gemini handles it directly`);
+        return { key: "gemini", ep, upstreamModel: ep.modelMap[origModel] || ep.defaultModel, directGemini: true };
+      }
       console.log(`[proxy] [IMAGE] image detected → routing to Gemini`);
-      return { key: "gemini", ep: ENDPOINTS.gemini, upstreamModel: ENDPOINTS.gemini.model };
+      return { key: "gemini", ep, upstreamModel: ep.model, isImagePipeline: true };
     }
   }
 
@@ -110,13 +479,20 @@ function resolveEndpoint(parsed) {
   for (const key of TEXT_PROVIDER_PRIORITY) {
     const ep = ENDPOINTS[key];
     if (!ep.apiKey) continue;
-    if (ep.modelMap && ep.modelMap[origModel]) return { key, ep, upstreamModel: ep.modelMap[origModel] };
+    if (ep.modelMap && ep.modelMap[origModel]) {
+      return { key, ep, upstreamModel: ep.modelMap[origModel], directGemini: key === "gemini" };
+    }
   }
   // Unknown model id: fall back to whichever text provider is actually configured,
   // instead of always DeepSeek (which may have no API key set).
   const fallbackKey = getPrimaryTextEndpoint();
   const fallbackEp = ENDPOINTS[fallbackKey];
-  return { key: fallbackKey, ep: fallbackEp, upstreamModel: fallbackEp.defaultModel };
+  return {
+    key: fallbackKey,
+    ep: fallbackEp,
+    upstreamModel: fallbackEp.defaultModel,
+    directGemini: fallbackKey === "gemini",
+  };
 }
 
 function cleanSchema(obj) {
@@ -525,10 +901,32 @@ function sendAnthropicRequest(ep, parsed, req, res, origModel) {
   upstream.end();
 }
 
+// OpenCode requires a session id; without it the API answers MissingSessionID
+// ("free tier can only be used in OpenCode"). Reuse the caller's when present,
+// otherwise derive a stable one from the first message so a conversation keeps
+// the same session across turns.
+function getOpenCodeSessionId(parsed, req) {
+  if (req && req.headers && req.headers["x-opencode-session"]) {
+    return req.headers["x-opencode-session"];
+  }
+  if (parsed && parsed.messages && parsed.messages.length > 0) {
+    const firstMsg = JSON.stringify(parsed.messages[0]);
+    let hash = 0;
+    for (let i = 0; i < firstMsg.length; i++) {
+      hash = (hash << 5) - hash + firstMsg.charCodeAt(i);
+      hash |= 0;
+    }
+    return "claude-session-" + Math.abs(hash).toString(36);
+  }
+  return "claude-session-default";
+}
+
 function sendOpenCodeRequest(ep, parsed, req, res, origModel) {
   const openAIBody = anthropicToOpenAIBody(parsed);
   const newBody = JSON.stringify(openAIBody);
-  const upstreamPath = ep.basePath;
+  // A model discovered on the non-Go surface has to be sent there: the Go base
+  // answers "Model … is not supported" for it.
+  const upstreamPath = (ep.modelBase && ep.modelBase[parsed.model]) || ep.basePath;
 
   const options = {
     hostname: ep.host,
@@ -539,6 +937,7 @@ function sendOpenCodeRequest(ep, parsed, req, res, origModel) {
     headers: {
       "Content-Type": "application/json",
       "Content-Length": Buffer.byteLength(newBody),
+      "x-opencode-session": getOpenCodeSessionId(parsed, req),
       "Authorization": "Bearer " + (ep.apiKey || ""),
     },
   };
@@ -626,6 +1025,136 @@ function sendOpenCodeRequest(ep, parsed, req, res, origModel) {
   });
 
   upstream.write(newBody);
+  upstream.end();
+}
+
+// ── Gemini as a text backend ─────────────────────────────
+// Google AI Studio speaks its own format, so the request is converted on the
+// way out and the response (or SSE stream) on the way back. The same call
+// handles images, since Gemini is multimodal.
+function sendGeminiRequest(ep, parsed, req, res, origModel, upstreamModel, retryCount = 0) {
+  const targetModel = upstreamModel || ep.defaultModel || ep.model;
+  const isStream = !!parsed.stream;
+
+  if (!parsed.max_tokens || parsed.max_tokens < 1024) parsed.max_tokens = 8192;
+
+  const geminiBody = anthropicToGeminiContents(parsed, origModel);
+  const geminiBodyStr = JSON.stringify(geminiBody);
+  const action = isStream ? "streamGenerateContent?alt=sse&key=" : "generateContent?key=";
+  const geminiPath = `${ep.basePath}/${targetModel}:${action}${ep.apiKey || ""}`;
+
+  console.log(`[proxy] [GEMINI] model: ${targetModel} (from ${origModel})`);
+  console.log(`[proxy] [GEMINI] → POST https://${ep.host}${ep.basePath}/${targetModel} (${geminiBodyStr.length} bytes, stream=${isStream})`);
+
+  const upstream = https.request(
+    {
+      hostname: ep.host,
+      port: 443,
+      path: geminiPath,
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(geminiBodyStr) },
+    },
+    (upstreamRes) => {
+      // Flash models throw 503 under load; one retry usually clears it.
+      if (upstreamRes.statusCode === 503 && retryCount < 2) {
+        console.log(`[proxy] [GEMINI] 503 — retrying in 500ms (attempt ${retryCount + 1})`);
+        upstreamRes.resume();
+        setTimeout(() => sendGeminiRequest(ep, parsed, req, res, origModel, targetModel, retryCount + 1), 500);
+        return;
+      }
+
+      if (upstreamRes.statusCode >= 400) {
+        let errBuf = "";
+        upstreamRes.on("data", (c) => (errBuf += c));
+        upstreamRes.on("end", () => {
+          console.error(`[proxy] [GEMINI] ⚠ ERROR ${upstreamRes.statusCode}: ${errBuf.substring(0, 500)}`);
+          if (!res.headersSent) res.writeHead(upstreamRes.statusCode, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ type: "error", error: { message: `Gemini API ${upstreamRes.statusCode}: ${errBuf}` } }));
+        });
+        return;
+      }
+
+      if (!isStream) {
+        res.writeHead(upstreamRes.statusCode, { "Content-Type": "application/json" });
+        let d = "";
+        upstreamRes.on("data", (c) => (d += c));
+        upstreamRes.on("end", () => {
+          console.log(`[proxy] [GEMINI] ← ${upstreamRes.statusCode} (${d.length} bytes)`);
+          try {
+            res.end(JSON.stringify(geminiToAnthropicResponse(JSON.parse(d), origModel)));
+          } catch {
+            res.end(d);
+          }
+        });
+        return;
+      }
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+
+      const state = { started: false, blockStarted: false, finished: false };
+      const emit = (events) => {
+        for (const ev of [].concat(events || [])) {
+          if (!ev) continue;
+          if (ev.type === "message_stop") state.finished = true;
+          res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+        }
+      };
+
+      const feed = (payload) => {
+        if (!payload || payload === "[DONE]") return;
+        try {
+          const chunk = JSON.parse(payload);
+          // The first chunk only opens the message, so run it until it stops
+          // producing events for this payload.
+          let guard = 0;
+          let events = geminiToAnthropicSSE(chunk, origModel, state);
+          while (events && guard++ < 4) {
+            emit(events);
+            const next = geminiToAnthropicSSE(chunk, origModel, state);
+            if (!next || JSON.stringify(next) === JSON.stringify(events)) break;
+            events = next;
+          }
+        } catch {
+          /* ignore non-json lines */
+        }
+      };
+
+      let buffer = "";
+      upstreamRes.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (line.startsWith("data: ")) feed(line.slice(6).trim());
+        }
+      });
+
+      upstreamRes.on("end", () => {
+        if (buffer.startsWith("data: ")) feed(buffer.slice(6).trim());
+        if (state.started && !state.finished) {
+          if (state.blockStarted) emit({ type: "content_block_stop", index: 0 });
+          emit([
+            { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } },
+            { type: "message_stop" },
+          ]);
+        }
+        res.end();
+        console.log(`[proxy] [GEMINI] ← stream complete`);
+      });
+    }
+  );
+
+  upstream.on("error", (err) => {
+    console.error("[proxy] [GEMINI] upstream error:", err.message);
+    if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ type: "error", error: { message: err.message } }));
+  });
+
+  upstream.write(geminiBodyStr);
   upstream.end();
 }
 
@@ -773,6 +1302,17 @@ function handleRequest(req, res) {
       proxy: "claude-deepseek-proxy",
       endpoints: "DeepSeek + OpenCode Go + GLM (Z.ai) + Gemini Flash (auto image routing)",
       activeTextBackend: ENDPOINTS[getPrimaryTextEndpoint()].label,
+      catalog: Object.fromEntries(
+        Object.keys(CATALOG_SOURCES).map((k) => [
+          k,
+          {
+            discovery: discoveryOn(k),
+            count: CATALOGS[k].models.length,
+            fetchedAt: CATALOGS[k].fetchedAt || null,
+            error: CATALOGS[k].error,
+          },
+        ])
+      ),
       models,
     }));
   }
@@ -806,7 +1346,7 @@ function handleRequest(req, res) {
 
     const origModel = parsed.model || "unknown";
     const origMaxTokens = parsed.max_tokens;
-    const { key: epKey, ep, upstreamModel } = resolveEndpoint(parsed);
+    const { key: epKey, ep, upstreamModel, directGemini } = resolveEndpoint(parsed);
 
     console.log(`[proxy] incoming: model=${origModel}, max_tokens=${origMaxTokens}, stream=${!!parsed.stream}, endpoint=${epKey}`);
 
@@ -825,6 +1365,13 @@ function handleRequest(req, res) {
       console.log(`[proxy] ← PROBE response`);
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify(probeResp));
+    }
+
+    // ── Gemini as the text backend (also multimodal) ──
+    if (directGemini) {
+      console.log(`[proxy] model map: ${origModel} → ${upstreamModel} (Google AI Studio)`);
+      sendGeminiRequest(ep, parsed, req, res, origModel, upstreamModel);
+      return;
     }
 
     // ── Route to DeepSeek (Anthropic format) ────────
@@ -922,6 +1469,11 @@ function geminiToAnthropicSSE(geminiChunk, origModel, state) {
 function startServer() {
   const server = https.createServer(tlsOptions, handleRequest);
   // Security: Bind server to localhost only to prevent external access
+  if (anyDiscoveryOn()) {
+    refreshAllCatalogs();
+    const timer = setInterval(refreshAllCatalogs, CATALOG_TTL_MS);
+    timer.unref();
+  }
 server.listen(PROXY_PORT, "127.0.0.1", () => {
     const activeKey = getPrimaryTextEndpoint();
     const activeEp = ENDPOINTS[activeKey];
@@ -929,6 +1481,10 @@ server.listen(PROXY_PORT, "127.0.0.1", () => {
     console.log(`  Listening:    https://127.0.0.1:${PROXY_PORT}`);
     console.log(`  Text backend: ${activeEp.label}${activeEp.apiKey ? "" : "  ⚠ no API key configured!"}`);
     console.log(`  Gemini Flash: auto image/OCR routing`);
+    const discovering = Object.keys(CATALOG_SOURCES).filter(discoveryOn);
+    if (discovering.length) {
+      console.log(`  Dynamic discovery: ${discovering.map((k) => ENDPOINTS[k].label).join(", ")}`);
+    }
     for (const [key, ep] of Object.entries(ENDPOINTS)) {
       if (ep.modelMap) {
         for (const [cModel, uModel] of Object.entries(ep.modelMap)) {

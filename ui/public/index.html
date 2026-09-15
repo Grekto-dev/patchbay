@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Patchbay — control panel</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🛰️</text></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header>
+  <div class="head-inner">
+    <div class="brand">
+      <img src="logo.svg" alt="" width="26" height="26">
+      <h1>Patchbay</h1>
+      <span id="brand-port">https://127.0.0.1:8877</span>
+    </div>
+    <div class="pill" id="status-pill"><span class="dot"></span><span id="status-text">checking…</span></div>
+    <div class="pill" id="backend-pill"><span id="backend-text">—</span></div>
+    <button id="btn-start" class="primary">Start</button>
+    <button id="btn-restart">Restart</button>
+    <button id="btn-stop" class="danger">Stop</button>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="banner" id="restart-banner">
+    <span>Configuration changed — restart the proxy to apply it.</span>
+    <span class="spacer"></span>
+    <button class="sm" id="banner-restart">Restart now</button>
+  </div>
+
+  <nav class="tabs">
+    <button data-tab="status" class="active">Status</button>
+    <button data-tab="keys">Keys &amp; provider</button>
+    <button data-tab="catalog">Models <span class="badge" id="catalog-badge">—</span></button>
+    <button data-tab="logs">Live logs <span class="badge" id="logs-badge">0</span></button>
+    <button data-tab="diag">Diagnostics</button>
+  </nav>
+
+  <!-- ── STATUS ─────────────────────────────── -->
+  <section class="panel active" id="tab-status">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Traffic this session</h2>
+          <p class="hint">Counted from the output of a proxy started by this panel.</p>
+        </div>
+        <button class="sm ghost" id="btn-clear-stats">Reset</button>
+      </div>
+      <div class="grid stats" id="stats-grid"></div>
+    </div>
+
+    <div class="card">
+      <h2>State</h2>
+      <p class="hint">The proxy, the active backend and the configuration files at a glance.</p>
+      <div class="rows" id="status-rows"></div>
+    </div>
+
+    <div class="card">
+      <h2>Getting started</h2>
+      <p class="hint">What is still missing before Claude Desktop can talk to the proxy.</p>
+      <ol class="steps" id="checklist"></ol>
+    </div>
+  </section>
+
+  <!-- ── KEYS ───────────────────────────────── -->
+  <section class="panel" id="tab-keys">
+    <div class="card">
+      <h2>API keys</h2>
+      <p class="hint">
+        Written to <code class="inline-code">.env</code> in the project root. Existing keys are shown
+        masked — leave a field empty to keep the current one.
+      </p>
+      <div id="key-fields"></div>
+      <div class="actions">
+        <button class="primary" id="btn-save-keys">Save keys</button>
+        <span class="spacer"></span>
+        <label class="chk"><input type="checkbox" id="chk-show-keys"> show what I am typing</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Text provider</h2>
+      <p class="hint">
+        With more than one key configured the proxy follows the priority OpenCode&nbsp;Go → GLM →
+        DeepSeek → Google&nbsp;AI&nbsp;Studio. Pin a provider here to override that order. Images go to
+        Google either way — straight to it when it is the text backend, through OCR otherwise.
+      </p>
+      <div class="provider-list" id="provider-list"></div>
+      <div class="actions" style="margin-top:14px">
+        <button class="primary" id="btn-save-provider">Save provider</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Proxy port</h2>
+      <p class="hint">
+        Changing the port does not require reissuing the certificates, but Claude Desktop has to point
+        at the new URL — use <b>Write configuration</b> under Diagnostics after saving.
+      </p>
+      <label class="field" style="max-width:220px">
+        <span class="lab">Port<small>default 8877</small></span>
+        <input type="number" id="inp-port" min="1" max="65535">
+      </label>
+      <div class="actions">
+        <button id="btn-save-port">Save port</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── CATALOG ────────────────────────────── -->
+  <section class="panel" id="tab-catalog">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Models by provider</h2>
+          <p class="hint">
+            With <b>discovery</b> on, the proxy asks that provider for its model list at startup
+            (and every 30 min) and publishes each model as a <code class="inline-code">claude-…</code>
+            id — which is all Claude Desktop requires. With it off, only the static maps in
+            <code class="inline-code">proxy/server.js</code> apply. Uncheck anything you do not want
+            in the model picker; with everything checked no list is written and the whole catalog
+            applies. Hover an id to rename it — the <code class="inline-code">claude-</code> prefix
+            is required and stays fixed.
+          </p>
+        </div>
+        <button class="sm ghost" id="btn-catalog-refresh">Refresh all</button>
+      </div>
+      <div class="log-toolbar">
+        <input type="text" id="catalog-filter" placeholder="filter models…">
+        <span class="spacer"></span>
+        <button class="sm ghost" id="btn-catalog-copy">Export to Claude Desktop</button>
+      </div>
+      <p class="hint" id="pricing-note" style="margin:12px 0 0"></p>
+      <pre class="out" id="catalog-out" hidden></pre>
+    </div>
+
+    <div id="catalog-cards"></div>
+  </section>
+
+  <!-- ── LOGS ───────────────────────────────── -->
+  <section class="panel" id="tab-logs">
+    <div class="card">
+      <div class="log-toolbar">
+        <input type="text" id="log-filter" placeholder="filter (model, endpoint, status…)">
+        <label class="chk"><input type="checkbox" id="chk-probes"> show probes</label>
+        <label class="chk"><input type="checkbox" id="chk-follow" checked> follow</label>
+        <button class="sm" id="btn-clear-log">Clear</button>
+      </div>
+      <div id="log"><div class="empty">No logs yet. Start the proxy from this panel to capture its output.</div></div>
+      <p class="hint" style="margin:12px 0 0" id="log-note"></p>
+    </div>
+  </section>
+
+  <!-- ── DIAGNOSTICS ────────────────────────── -->
+  <section class="panel" id="tab-diag">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>TLS certificates</h2>
+          <p class="hint">Claude Desktop only accepts an HTTPS gateway with a valid chain.</p>
+        </div>
+      </div>
+      <div class="rows" id="cert-rows"></div>
+      <div class="actions" style="margin-top:14px">
+        <button id="btn-gen-certs">Generate certificates</button>
+        <button id="btn-install-ca">Install CA in the system</button>
+      </div>
+      <pre class="out" id="cert-out" hidden></pre>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Claude Desktop</h2>
+          <p class="hint">
+            <code class="inline-code">developer_settings.json</code> has to exist at both paths, with the
+            gateway pointing at the proxy. A <code class="inline-code">.bak</code> is written before
+            anything is overwritten.
+          </p>
+        </div>
+      </div>
+      <div class="rows" id="desktop-rows"></div>
+      <div class="actions" style="margin-top:14px">
+        <button id="btn-write-desktop">Write configuration</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Connectivity test</h2>
+          <p class="hint">Runs <code class="inline-code">proxy/test-proxy.js</code> against the running proxy.</p>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="primary" id="btn-test">Run test</button>
+      </div>
+      <pre class="out" id="test-out" hidden></pre>
+    </div>
+
+    <div class="card">
+      <h2>Manual steps in Claude Desktop</h2>
+      <ol class="steps">
+        <li>Open Claude Desktop <b>without signing in</b> (stay on the login screen).</li>
+        <li><b>Help → Troubleshooting → Enable Developer Mode</b>.</li>
+        <li><b>Developer → Configure third-party inference</b>: provider <code>Gateway</code>, URL <code id="gw-url">https://localhost:8877</code>, key <code>proxy-local-key</code>.</li>
+        <li>Fill in the <b>model list</b> — or use <b>Import</b> with the JSON from <b>Export to Claude Desktop</b> on the Models tab — and click <b>Apply locally</b>.</li>
+        <li>Quit the app completely (tray included) and open it again.</li>
+      </ol>
+    </div>
+  </section>
+
+</div>
+
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

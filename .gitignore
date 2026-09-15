@@ -32,3 +32,6 @@ logs/
 # Env variants
 .env.*
 !.env.example
+
+# Overrides locais escritos pelo painel (ui/)
+proxy-config.json

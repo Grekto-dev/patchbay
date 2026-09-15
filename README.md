@@ -1,263 +1,457 @@
-# Claude Desktop → DeepSeek / OpenCode Go / GLM / Gemini Proxy
+<div align="center">
 
-A local HTTPS proxy that lets **Claude Desktop** use **DeepSeek**, **OpenCode Go**, **GLM (Z.ai)**, and **Google Gemini Flash 2.5** APIs instead of Anthropic's official API — for a fraction of the cost.
+<img src="assets/logo.svg" width="104" alt="Patchbay logo">
+
+# Patchbay
+
+**A local gateway that lets Claude Desktop run on other models.**
+
+Point the app at a proxy on your own machine and its model picker fills up with
+OpenCode Go, DeepSeek, GLM and Google AI Studio models — including free ones —
+while the interface, the tools and the workflow stay exactly as they are.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Node 18+](https://img.shields.io/badge/node-%E2%89%A518-5fa04e)
+![Dependencies: none](https://img.shields.io/badge/dependencies-none-8957e5)
+![Platforms](https://img.shields.io/badge/windows%20%C2%B7%20macos%20%C2%B7%20linux-supported-6e7781)
+
+</div>
+
+---
+
+## What it is
+
+Claude Desktop can be told to send its inference to a **gateway** instead of
+Anthropic's API. Patchbay is that gateway, running on `localhost`: it accepts
+Anthropic-format requests, translates them, and forwards them to whichever
+provider you configured.
 
 ```
-                                                        ┌─→ DeepSeek API    (text & reasoning)
-Claude Desktop → HTTPS (127.0.0.1:8877) → Local proxy ─┼─→ OpenCode Go     (text & reasoning, alternative)
-                                                        ├─→ GLM (Z.ai)      (text & reasoning, alternative)
-                                                        └─→ Gemini Flash   (images & OCR)
+                                   ┌─→ OpenCode Go       text · 45 models, 8 of them free
+Claude Desktop                     │
+      │  HTTPS                     ├─→ DeepSeek          text
+      ▼                            │
+https://127.0.0.1:8877  ──────────►├─→ GLM (Z.ai)        text
+   Patchbay proxy                  │
+      ▲                            └─→ Google AI Studio  text + images
+      │
+http://127.0.0.1:8878
+   Patchbay panel  ── start/stop · keys · models · live logs · diagnostics
 ```
 
-## What you need
+One text provider answers at a time. Images are always handled by Google —
+directly when it is also the text backend, through an OCR hand-off otherwise.
 
-| Requirement | Notes |
+## Highlights
+
+- **Web control panel.** Start and stop the proxy, write API keys, pick the
+  provider, browse model catalogs, watch traffic live, generate certificates
+  and configure Claude Desktop — without touching a config file.
+- **Live model catalogs.** Each provider is asked what it currently serves, and
+  every model is published as a `claude-…` id that Claude Desktop accepts. No
+  hand-maintained lists that rot the week a provider renames something.
+- **Free models surfaced.** OpenCode's free tier is discovered and labelled,
+  with the cost of every other model shown next to it.
+- **Zero dependencies.** Node's standard library only — no `npm install`, no
+  lockfile to audit, nothing to keep patched.
+- **Local by construction.** Both servers bind to `127.0.0.1`, no CORS headers
+  are sent, and API keys never leave your machine except to their own provider.
+
+---
+
+## Requirements
+
+| | |
 |---|---|
-| **Node.js v18+** | The setup script installs it automatically if missing (Windows) |
-| **A text-provider API key** | Pick **one**: **DeepSeek** (https://platform.deepseek.com — free credits on signup), **OpenCode Go** (https://opencode.ai), or **GLM** (https://z.ai — GLM Coding Plan) |
-| **Gemini API key** | https://aistudio.google.com/apikey — 1000 req/day free, no credit card, always required (used for image OCR) |
-| **Claude Desktop** | Already installed |
-
-> **Which text provider?** All three speak to the proxy differently under the hood, but you never see it: DeepSeek and GLM both use the proxy's native Anthropic-style format (`x-api-key` auth, no conversion needed); **OpenCode Go** is OpenAI-compatible and is automatically translated to/from the Anthropic format. The setup script asks you to choose one as your primary provider — you only need one key, not all three. If more than one key is set in `.env`, priority is **OpenCode Go → GLM → DeepSeek**.
+| **Node.js 18+** | `node --version`. The setup scripts install it on Windows via winget if missing. |
+| **Claude Desktop** | Already installed and updated. |
+| **One text provider key** | [OpenCode Go](https://opencode.ai) · [DeepSeek](https://platform.deepseek.com) · [GLM / Z.ai](https://z.ai) — pick one, or several and switch in the panel. |
+| **A Google AI Studio key** | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free tier, no card. Needed for images, and enough on its own if you want Google to answer everything. |
 
 ---
 
 ## Quick start
 
-### Windows
+```bash
+git clone https://github.com/Grekto-dev/claude-desktop-proxy.git patchbay
+cd patchbay
+```
+
+**Windows**
 
 ```cmd
 setup.bat
 ```
 
-Double-click `setup.bat` or run it from a terminal. The script will:
-
-1. Install Node.js automatically if not found (via winget)
-2. Ask you to choose a text provider — **DeepSeek**, **OpenCode Go**, or **GLM**
-3. Ask for your API keys (chosen provider + Gemini) and create `.env`
-4. Generate TLS certificates (no OpenSSL needed — pure PowerShell)
-5. Install the CA certificate in the Windows trust store
-6. Write Claude Desktop config files
-7. **Start the proxy** so Claude Desktop can connect immediately
-8. Walk you through the two manual steps in Claude Desktop
-9. Optionally register an auto-start task at Windows login
-
-### Linux / macOS
+**macOS / Linux**
 
 ```bash
-chmod +x setup.sh
-./setup.sh
+chmod +x setup.sh && ./setup.sh
 ```
 
-Same flow — the script handles everything interactively.
+The setup script asks for your keys, generates the TLS certificates, installs
+the local CA, writes Claude Desktop's config and starts the proxy. When it is
+done, open the panel:
+
+```cmd
+panel.bat          :: Windows (double-click works too)
+```
+```bash
+./panel.sh         # macOS / Linux
+```
+
+Everything the script does can also be done from the panel, so if you prefer to
+skip the script entirely, run `panel.bat` / `./panel.sh` on a fresh clone and
+work through the **Getting started** checklist on the Status tab.
 
 ---
 
-## Model mapping
+## Setting up Claude Desktop
 
-| Model in Claude Desktop | Backend (DeepSeek) | Backend (OpenCode Go) | Backend (GLM) | Use for |
+Two steps happen inside the app itself and cannot be automated.
+
+### 1. Enable Developer Mode
+
+Open Claude Desktop **without signing in** — stay on the login screen. Then, in
+the menu at the **top left** of the window:
+
+> **Help → Troubleshooting → Enable Developer Mode**
+
+The app will ask to restart. Let it.
+
+### 2. Configure third-party inference
+
+Back in the same top-left menu, a new entry has appeared:
+
+> **Developer → Configure third-party inference**
+
+Fill in:
+
+| Field | Value |
+|---|---|
+| Inference provider | `Gateway` |
+| Gateway base URL | `https://localhost:8877` |
+| Gateway API key | `proxy-local-key` |
+| Auth scheme | `Bearer` |
+
+Then the **model list**. Either add entries by hand — any id starting with
+`claude-` is accepted, and the display name and tier are up to you — or use the
+panel's **Export to Claude Desktop** button (Models tab), which copies a
+ready-to-import block:
+
+```json
+{
+  "inferenceGatewayBaseUrl": "https://localhost:8877",
+  "inferenceGatewayApiKey": "proxy-local-key",
+  "modelDiscoveryEnabled": false,
+  "inferenceModels": [
+    { "name": "claude-kimi-k3", "labelOverride": "kimi-k3", "anthropicFamilyTier": "sonnet" }
+  ]
+}
+```
+
+Paste it into the **Import** field on that same screen. The header keys matter —
+importing a bare array is rejected.
+
+Click **Apply locally**, quit Claude Desktop completely (tray icon included),
+and reopen it. Your models are in the picker.
+
+> **Tip.** Setting `modelDiscoveryEnabled` to `true` makes Claude Desktop read
+> the model list from the gateway's `/v1/models` by itself, so the catalog
+> follows your providers with no further imports. You lose the custom display
+> names and tier grouping, which is why the export defaults it to `false`.
+
+---
+
+## The control panel
+
+`http://127.0.0.1:8878` — five tabs.
+
+| Tab | What lives there |
+|---|---|
+| **Status** | Proxy up/down, active backend, request / probe / image / error counters, per-backend split, and a checklist of what is still missing. |
+| **Keys & provider** | Write or remove API keys (stored in `.env`, shown masked), pin a text provider instead of relying on priority, change the proxy port. |
+| **Models** | One card per provider: toggle discovery, pick which models to expose, rename their ids, export the Claude Desktop config. |
+| **Live logs** | The proxy's output, colour-coded and filterable — requests, images, probes, errors. |
+| **Diagnostics** | Generate certificates, install the CA, write `developer_settings.json`, run the connectivity test. |
+
+Start / Stop / Restart run the proxy as a child process, which is how its output
+reaches the log tab. A proxy started elsewhere (`start.bat`, a scheduled task)
+is still detected and can be stopped from the panel — the panel simply cannot
+show its output.
+
+To drive a different checkout from one panel:
+
+```bash
+PROXY_ROOT=/path/to/other/patchbay node ui/server.js
+```
+
+`UI_PORT=8879 node ui/server.js` moves the panel itself.
+
+---
+
+## Models
+
+### Where the lists come from
+
+Claude Desktop accepts **any** model id beginning with `claude-`, and resolves
+the display name, the tier and the 1M-context variants on its own side. So the
+proxy does not need a curated list — it only needs to know which ids to accept
+and where to send them.
+
+With **discovery** on for a provider, the proxy asks it for its catalog at
+startup and every 30 minutes, then publishes each model as `claude-<slug>`:
+`kimi-k2.5` becomes `claude-kimi-k2-5`, `glm-5.3-flash` becomes
+`claude-glm-5-3-flash`.
+
+| Provider | Catalog endpoint |
+|---|---|
+| OpenCode | `/zen/go/v1/models` **and** `/zen/v1/models` on `opencode.ai`, merged |
+| DeepSeek | `https://api.deepseek.com/models` |
+| GLM (Z.ai) | `https://api.z.ai/api/coding/paas/v4/models`, falling back to `/api/paas/v4/models` |
+| Google AI Studio | `https://generativelanguage.googleapis.com/v1beta/models` |
+
+Discovery is optional. With it off, the static maps in `proxy/server.js` apply:
+
+| Claude Desktop id | OpenCode Go | DeepSeek | GLM | Google |
 |---|---|---|---|---|
-| `claude-sonnet-4-5` / `claude-sonnet-4-6` | DeepSeek V4 Flash | `deepseek-v4-flash` | `glm-5-turbo` | Text, reasoning, chat |
-| `claude-opus-4-7` | DeepSeek V4 Pro | `deepseek-v4-flash` | `glm-5.2` | Complex reasoning |
-| `claude-haiku-4-5-20251001` | DeepSeek V4 Flash | `deepseek-v4-flash` | `glm-4.5-air` | Fast/cheap tasks |
-| Images (auto-routed) | **Gemini Flash 2.5** | **Gemini Flash 2.5** | **Gemini Flash 2.5** | OCR, image analysis, vision |
+| `claude-sonnet-4-5` / `-4-6` | `deepseek-v4-flash` | `deepseek-v4-flash` | `glm-5-turbo` | `gemini-3.6-flash` |
+| `claude-opus-4-7` | `deepseek-v4-flash` | `deepseek-v4-pro` | `glm-5.2` | `gemini-3.8-flash` |
+| `claude-haiku-4-5-20251001` | `deepseek-v4-flash` | `deepseek-v4-flash` | `glm-4.5-air` | `gemini-3.1-flash-lite` |
 
-Only one text backend is active at a time, based on which API key is configured in `.env` — priority is **OpenCode Go → GLM → DeepSeek** if more than one key is present. Images are always auto-detected and routed to Gemini regardless of the text backend, no manual model switching needed. Just use `claude-sonnet-4-5` for everything.
+Provider lineups move fast — the GLM ids above are inherited from upstream and
+may already be gone. Turning discovery on is the maintenance-free option.
 
-> GLM model ids move fast as Z.ai releases new versions — check https://z.ai for the current lineup if `glm-5-turbo` / `glm-5.2` / `glm-4.5-air` stop working, and update the `modelMap` in `proxy/server.js`.
+### Free models
+
+The provider APIs return ids and nothing else: no price, no free flag. Costs
+come from [models.dev](https://models.dev), the model database OpenCode itself
+maintains, where a model counts as free when input and output both cost 0. Free
+models get a `free` tag; everything else shows `$in / $out` per million tokens.
+
+OpenCode is a special case: one key reaches **two** surfaces with different
+models, and the free ones only exist on the non-Go surface. Patchbay merges the
+two — everything from the Go plan, and **only the free models** from the other,
+since anything paid there is already covered by Go — and routes each model back
+to the base it came from. At the time of writing that is 45 models, 8 of them
+free.
+
+### Renaming and filtering
+
+Hover an id in the Models tab and click the pencil to rename it. The `claude-`
+prefix is fixed, the rest is slugified, and an id already used by another model
+is refused. Uncheck models you do not want in the picker; with everything
+checked, no list is written and the whole catalog applies.
 
 ---
 
-## Image pipeline
+## Google AI Studio as a text provider
 
-```
-User uploads image
-       │
-       ▼
-Proxy detects image → Gemini Flash 2.5 (OCR + description)
-       │
-       ▼
-Description injected into request → configured text backend (final response)
-```
+Gemini is not only the image backend. Pin **Google AI Studio** on the Keys tab
+(or configure no other provider key) and it answers everything — with its own
+discovered catalog, so a specific Gemini model stays reachable by id even while
+another provider handles the rest.
 
-The image pipeline uses whichever text provider you configured (DeepSeek, OpenCode Go, or GLM) — not hardcoded to any single one.
+Google lists image, music, speech and agent-only models side by side with the
+chat ones, all under `generateContent`, with no modality field to tell them
+apart. Patchbay filters the catalog down to text models: the Nano Banana /
+`*-image` family, Lyria (music), TTS and transcribe, Omni, Robotics-ER,
+Computer Use and `antigravity-*` / `deep-research-*` are dropped — the last two
+answer `This model only supports Interactions API` anyway. The whole
+`gemini-2.5-*` family is dropped too: Google retired it for new keys (404,
+"no longer available to new users") while still advertising it in the API.
 
-Supported formats: JPEG, PNG, WEBP, HEIC, HEIF
+The rule lives in `isTextModel()` in both `proxy/server.js` and `ui/server.js`;
+widen it there if Google ships a category this misses.
+
+Two things to know about the free tier:
+
+- **Pro models answer 429.** `gemini-pro-latest` and `gemini-3.1-pro-preview`
+  are out of quota on a free key, which is why the defaults stay on Flash.
+  Discovery still lists them — pick one if your key has the quota.
+- **The `-latest` aliases currently resolve to thinking models.** Asking
+  `gemini-flash-latest` for a one-word answer took 53 seconds and spent the
+  entire token budget on thoughts before replying. The concrete ids in the
+  table above answer in about two seconds.
 
 ---
 
-## Starting / stopping the proxy
+## Images
 
-**Start:**
-```cmd
-start.bat        # Windows
-./start.sh       # Linux/macOS
-node proxy/server.js  # any platform
+```
+image in the request
+        │
+        ├── Google is the text backend ──→ sent straight to Gemini (multimodal)
+        │
+        └── another provider answers ────→ Gemini describes it, the description
+                                           is injected into the prompt, and the
+                                           text provider writes the reply
 ```
 
-**Stop:**
-```cmd
-taskkill /f /im node.exe    # Windows
-pkill -f 'node.*server.js'  # Linux/macOS
+Supported formats: JPEG, PNG, WEBP, HEIC, HEIF.
+
+---
+
+## Configuration
+
+### `.env`
+
+Written by the setup script or the panel; one key per provider.
+
+```env
+OPENCODE_API_KEY=...     # https://opencode.ai
+GLM_API_KEY=...          # https://z.ai
+DEEPSEEK_API_KEY=...     # https://platform.deepseek.com
+GEMINI_API_KEY=...       # https://aistudio.google.com/apikey
 ```
 
-**Auto-start at login (Windows):**  
-The setup script offers this automatically. To remove it later:
+With more than one configured, priority is
+**OpenCode Go → GLM → DeepSeek → Google AI Studio**. Pinning a provider in the
+panel overrides that order.
+
+### `proxy-config.json`
+
+Optional, gitignored, written by the panel and read by the proxy at startup.
+Delete it to return to the built-in defaults. Nothing here rewrites
+`proxy/server.js`.
+
+```jsonc
+{
+  "port": 8877,                       // proxy port
+  "provider": "gemini",               // pinned text provider
+  "discovery": {                      // pull live catalogs
+    "opencode": true,
+    "gemini": true
+  },
+  "catalogEnabled": {                 // omit a provider to expose its whole catalog
+    "deepseek": ["deepseek-v4-pro"]
+  },
+  "catalogIds": {                     // renamed ids
+    "opencode": { "minimax-m3": "claude-minimax-m3-turbo" }
+  },
+  "models": {                         // hand-written entries; these win over discovery
+    "glm": { "claude-sonnet-4-5": "glm-5.3" }
+  }
+}
+```
+
+---
+
+## Running and stopping
+
+```cmd
+panel.bat                 :: control panel (recommended — it can start the proxy)
+start.bat                 :: proxy only
+node proxy/server.js      :: proxy only, any platform
+```
+
+```cmd
+taskkill /f /im node.exe           :: Windows
+```
+```bash
+pkill -f 'node.*server.js'         # macOS / Linux
+```
+
+Auto-start at Windows login is offered by `setup.bat`. To remove it:
+
 ```cmd
 schtasks /delete /tn ClaudeDeepSeekProxy /f
 ```
 
 ---
 
-## Project structure
+## Project layout
 
 ```
-/
-├── setup.bat               Windows automated setup (interactive)
-├── setup.sh                Linux/macOS automated setup (interactive)
-├── start.bat               Windows quick launcher
-├── start.sh                Linux/macOS quick launcher
-├── .env.example            API keys template
+.
+├── panel.bat / panel.sh     Control panel launchers
+├── start.bat / start.sh     Proxy launchers
+├── setup.bat / setup.sh     Interactive first-time setup
+├── .env                     API keys (gitignored)
+├── proxy-config.json        Panel-written overrides (gitignored)
+├── assets/logo.svg
 ├── proxy/
-│   ├── server.js           The proxy server
-│   └── test-proxy.js       Connectivity test
-├── certs/
-│   ├── generate-certs.ps1  Generate certs — Windows (PowerShell native, no OpenSSL)
-│   ├── generate-certs.sh   Generate certs — Linux/macOS
-│   ├── install-ca.ps1      Install CA in trust store — Windows
-│   ├── install-ca.sh       Install CA in trust store — Linux/macOS
-│   ├── ca.cnf              CA config (used by .sh only)
-│   └── server.cnf          Server cert config (used by .sh only)
-└── mcp-gemini-vision/      MCP Gemini Vision extension
+│   ├── server.js            The proxy: routing, format translation, catalogs
+│   └── test-proxy.js        Connectivity test
+├── ui/
+│   ├── server.js            Control panel server (no dependencies)
+│   └── public/              Panel front-end
+├── certs/                   Certificate generation and CA install scripts
+└── mcp-gemini-vision/       Optional MCP server for Gemini vision (from upstream)
 ```
 
 ---
 
-## Security Hardening
+## Security
 
-This fork implements several security fixes to ensure the proxy is safe for local use:
-
-- **Localhost Binding (`127.0.0.1`)**: The server listens exclusively on `127.0.0.1` instead of `0.0.0.0`. This prevents other devices on the same local area network (LAN) or the public internet from accessing your proxy and abusing your API keys.
-- **CORS Restrictions**: Wildcard CORS headers (`Access-Control-Allow-Origin: *`) have been disabled. This prevents malicious websites loaded in your web browser from executing CSRF-like attacks (Confused Deputy) to query your local proxy.
-- **Payload Size Limits**: Request bodies are capped at a maximum of **50 MB** to protect the node process against memory exhaustion (DoS attacks).
-- **Strict Payload Validation**: Request bodies are validated as valid JSON objects before processing to prevent crashes or unexpected behavior from malformed input formats.
-- **API Key Isolation**: Client-supplied `x-api-key` headers are not blindly forwarded to upstream endpoints, ensuring your configured API keys are kept isolated and secure.
+- Both servers listen on `127.0.0.1` only — nothing on your LAN can reach them.
+- No CORS headers are sent, and every mutating panel call requires an `x-panel`
+  header, which a web page cannot set cross-origin without a preflight. A site
+  you happen to be visiting cannot drive the panel.
+- API keys are never sent back to the browser; the panel only shows a masked
+  preview.
+- Client-supplied `x-api-key` headers are not forwarded upstream.
+- Request bodies are capped at 50 MB and validated as JSON.
+- The TLS certificate is generated locally and the CA is installed only in your
+  own trust store. Claude Desktop rejects a self-signed certificate without
+  `CA:TRUE`, which is why a small local CA exists at all.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Fix |
+| Symptom | Cause and fix |
 |---|---|
-| `ERR_CERT_AUTHORITY_INVALID` | Run `certs\install-ca.ps1` (Windows) or `./certs/install-ca.sh` (macOS/Linux) |
-| Model not visible in Claude Desktop | Only names with `-sonnet-`, `-opus-`, `-haiku-` are accepted |
-| "server is busy" loop | The proxy is not running — start it with `start.bat` / `start.sh` |
-| Image upload 503 | Use drag & drop or the `+` button — the Quick Entry shortcut bypasses the gateway |
-| Gemini 429 rate limit | Free tier limit reached (1000 req/day) — wait or upgrade |
+| `ERR_CERT_AUTHORITY_INVALID` | The CA is not trusted yet. Diagnostics → **Install CA in the system**, or run `certs\install-ca.ps1` / `./certs/install-ca.sh`. |
+| "server is busy" loop in Claude Desktop | The proxy is not running. Start it from the panel. |
+| Model missing from the picker | The id must start with `claude-`. Add it under **Configure third-party inference**, or enable `modelDiscoveryEnabled`. |
+| `MissingSessionID` from OpenCode | OpenCode requires an `x-opencode-session` header; the proxy sends one. Seeing this means an older `proxy/server.js` is running. |
+| `Model … is not supported` (OpenCode) | The model lives on the other OpenCode surface. Enable discovery so the proxy learns which base each model belongs to. |
+| `429 quota exceeded` (Google) | Gemini Pro models are not available on the free AI Studio tier. Use a Flash model or enable billing. |
+| `404 no longer available to new users` (Google) | A retired model id. Refresh the catalog in the panel; `gemini-2.5-*` is filtered out for this reason. |
+| Gemini takes ~1 minute for a short answer | A thinking model burning the budget before replying, typically through a `-latest` alias. Pick a concrete id such as `gemini-3.6-flash`. |
+| Image upload returns 503 | Use drag & drop or the `+` button; the Quick Entry shortcut bypasses the gateway. |
+| Panel says the port is in use | It is already open in another window, or something else holds 8878. `UI_PORT=8879 node ui/server.js`. |
+| Live logs stay empty | The proxy was started outside the panel. Stop it and start it from the panel. |
+
+The **Diagnostics** tab runs `proxy/test-proxy.js` against the running proxy and
+prints a health check, a probe test and a malformed-payload test.
 
 ---
 
-## Manual setup (advanced)
+## Limitations
 
-<details>
-<summary>Click to expand — only needed if the automated setup fails</summary>
-
-### 1. Clone and configure keys
-
-```bash
-git clone https://github.com/simoianni/claude-desktop-proxy.git
-cd claude-desktop-proxy
-cp .env.example .env    # Linux/macOS
-copy .env.example .env  # Windows
-```
-
-Edit `.env` — set **one** of the three text-provider keys (`DEEPSEEK_API_KEY`, `OPENCODE_API_KEY`, or `GLM_API_KEY`), plus Gemini:
-```env
-DEEPSEEK_API_KEY=sk-...          # https://platform.deepseek.com
-OPENCODE_API_KEY=...             # https://opencode.ai — priority 1 if set
-GLM_API_KEY=...                  # https://z.ai — priority 2 if set
-GEMINI_API_KEY=...               # https://aistudio.google.com/apikey — always required
-```
-
-### 2. Generate TLS certificates
-
-Claude Desktop requires HTTPS for gateway connections.
-
-**Windows** (no OpenSSL needed):
-```powershell
-powershell -ExecutionPolicy Bypass -File certs\generate-certs.ps1
-```
-
-**Linux/macOS** (requires OpenSSL):
-```bash
-chmod +x certs/generate-certs.sh && ./certs/generate-certs.sh
-```
-
-### 3. Install the CA certificate
-
-**Windows:**
-```powershell
-powershell -ExecutionPolicy Bypass -File certs\install-ca.ps1
-```
-
-**macOS:**
-```bash
-./certs/install-ca.sh
-```
-
-**Linux (Debian/Ubuntu/RHEL):**
-```bash
-sudo ./certs/install-ca.sh
-```
-
-### 4. Configure Claude Desktop
-
-Create `developer_settings.json` in **both** paths:
-
-| OS | Path |
-|---|---|
-| Windows | `%APPDATA%\Claude\developer_settings.json` |
-| Windows | `%LOCALAPPDATA%\Claude-3p\developer_settings.json` |
-| macOS | `~/Library/Application Support/Claude/developer_settings.json` |
-| macOS | `~/Library/Application Support/Claude-3p/developer_settings.json` |
-
-```json
-{
-  "allowDevTools": true,
-  "gateway": {
-    "url": "https://localhost:8877"
-  }
-}
-```
-
-### 5. Enable Developer Mode and add models
-
-1. Open Claude Desktop (**do not sign in** — stay on the login screen)
-2. **Help → Troubleshooting → Enable Developer Mode**
-3. **Developer → Configure third-party inference**
-   - Inference provider: `Gateway`
-   - Gateway base URL: `https://localhost:8877`
-   - Gateway API key: `proxy-local-key`
-   - Add models: `claude-sonnet-4-5` (label: `sonnet 4.5`) and `claude-opus-4-7` (label: `claude opus 4.7`)
-4. Click **Apply locally**
-
-### 6. Start the proxy and relaunch Claude Desktop
-
-```bash
-node proxy/server.js
-```
-
-Quit Claude Desktop completely (tray too), reopen it, and select one of the configured models.
-
-</details>
+- **One text backend at a time.** Providers are not load-balanced or failed
+  over; the pinned one (or the first configured by priority) answers everything.
+- **Free-tier labels depend on models.dev.** If it is unreachable, the panel
+  shows no cost data and the proxy falls back to matching `-free` in the model
+  name — which misses free models named otherwise, such as `big-pickle`.
+- **Catalogs are cached.** 30 minutes in the proxy, 5 minutes in the panel
+  (12 hours for pricing). Use **Refresh** when a provider has just shipped
+  something.
+- **Config changes need a restart.** The proxy reads `proxy-config.json` and
+  `.env` at startup; the panel shows a banner and a one-click restart.
+- **The panel only logs proxies it started.** An externally started proxy is
+  detected and controllable, but its output goes wherever it was launched from.
+- **Provider quirks are not hidden.** A model that is unavailable, rate-limited
+  or retired upstream fails as it would without the proxy; the error is passed
+  through, not masked.
+- **Tested on Windows 11.** The macOS and Linux paths exist and are
+  straightforward, but have had less exercise.
 
 ---
 
-## Technical notes
+## Credits
 
-- **Why a local CA?** Claude Desktop's sandbox strictly verifies TLS chains. A self-signed cert without `CA:TRUE` in Basic Constraints is rejected.
-- **Probe interception:** Claude Desktop sends `max_tokens=1` requests to validate connectivity. The proxy responds locally without hitting upstream APIs.
-- **Port 8877:** Arbitrary — change it in `proxy/server.js` and in Claude Desktop settings.
-- **OpenCode Go format translation:** DeepSeek and GLM speak the proxy's native Anthropic-style messages format directly (`x-api-key` auth). OpenCode Go is OpenAI-compatible instead, so the proxy converts requests (`anthropicToOpenAIBody`) and responses (`openAIToAnthropicResponse` / SSE chunk translation) on the fly, including tool calls and streaming — Claude Desktop never sees the difference.
-- **Text-provider selection:** configured in `proxy/server.js` under `ENDPOINTS` / `TEXT_PROVIDER_PRIORITY` / `resolveEndpoint()`. Order of preference is OpenCode Go → GLM → DeepSeek; a provider is only used if its API key is set in `.env`. The same priority is shared by the image pipeline (`getPrimaryTextEndpoint()`), so image messages always go through the provider you actually configured.
-- **GLM endpoint:** `https://api.z.ai/api/anthropic/v1/messages` (Anthropic-compatible, same auth scheme as DeepSeek). Model ids are Z.ai's current GLM Coding Plan lineup as of mid-2026 and may change — see the note in the Model mapping section.
+Patchbay is a fork of **[simoianni/claude-desktop-proxy](https://github.com/simoianni/claude-desktop-proxy)** —
+the original project worked out the hard parts: that Claude Desktop needs a
+properly chained local CA, that its connectivity probes must be intercepted,
+and how the gateway plumbing fits together. Thank you for building and
+publishing it; everything here stands on that work.
+
+Thanks also to [models.dev](https://models.dev) for the open model database
+behind the cost and free-tier labels.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
