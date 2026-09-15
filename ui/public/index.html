@@ -234,12 +234,22 @@
       </div>
 
       <p class="hint" id="pricing-note" style="margin:12px 0 0"></p>
-      <pre class="out" id="catalog-out" hidden></pre>
-      <div class="actions" id="catalog-out-actions" hidden>
-        <button class="sm" id="btn-catalog-copy-again">Copy JSON</button>
-        <span class="hint" style="margin:0">
-          Paste it into <b>Developer → Configure third-party inference → Import</b>.
-        </span>
+      <p class="hint" style="margin:6px 0 0">
+        Claude Desktop only accepts ids in its own families —
+        <code class="inline-code">claude-haiku-…</code>, <code class="inline-code">claude-sonnet-…</code>,
+        <code class="inline-code">claude-opus-…</code>, <code class="inline-code">claude-fable-…</code> and
+        <code class="inline-code">claude-mythos-…</code> — so anything else is refused. The version part is
+        free, and Patchbay numbers ten models per version (<code class="inline-code">claude-opus-3</code>
+        through <code class="inline-code">claude-opus-3-9</code>, then <code class="inline-code">claude-opus-4</code>).
+        Ids are renumbered whenever the selection changes; use the padlock to keep one where it is.
+      </p>
+
+      <div id="export-box" hidden>
+        <pre class="out" id="catalog-out"></pre>
+        <div class="actions">
+          <button class="sm" id="btn-copy-out">Copy</button>
+          <span class="hint" style="margin:0" id="export-count"></span>
+        </div>
       </div>
     </div>
 

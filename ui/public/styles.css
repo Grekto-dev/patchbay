@@ -294,6 +294,23 @@ tr.off td:not(.tight) { opacity: .45; }
 .filter-field select { font-size: 12.5px; padding: 6px 9px; }
 .filter-count { margin: 12px 0 0 !important; font-variant-numeric: tabular-nums; }
 
+.idnone { color: var(--text-faint); }
+
+button.lock {
+  padding: 2px 6px;
+  font-size: 12px;
+  line-height: 1;
+  background: transparent;
+  border-color: transparent;
+  filter: grayscale(1) opacity(.5);
+  transition: filter .12s;
+}
+button.lock:hover:not(:disabled) { background: transparent; border-color: var(--border); filter: grayscale(.3) opacity(.9); }
+button.lock.on { filter: none; }
+
+#export-box { margin-top: 14px; }
+#export-box .actions { margin-top: 10px; }
+
 /* sortable column headers */
 th.sortable {
   cursor: pointer;

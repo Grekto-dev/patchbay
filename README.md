@@ -206,8 +206,9 @@ exist and where each one points.
 
 Patchbay handles that naming itself. With **discovery** on for a provider, it
 asks for the catalog at startup and every 30 minutes, then publishes each model
-as `claude-<family>-3`, `claude-<family>-3-1`, `claude-<family>-3-2`, … The
-family comes from the price per million input tokens:
+as `claude-<family>-<version>`, ten per version: `claude-opus-3`,
+`claude-opus-3-1` … `claude-opus-3-9`, then `claude-opus-4`. The family comes
+from the price per million input tokens:
 
 | Family | When |
 |---|---|
@@ -220,8 +221,10 @@ So `big-pickle` (free) becomes `claude-haiku-3-16`, `kimi-k3` ($3/M) becomes
 `claude-opus-3`. The numbering is global: every provider draws from the same
 counters, so two of them never collide in the one list Claude Desktop sees.
 
-Ids you edit by hand are kept in `proxy-config.json` and survive every refresh;
-the generated ones are recomputed around them.
+Ids are **renumbered whenever the selection changes** — untick a model and the
+ones after it move up to fill the gap. Click the padlock on a row to pin its id
+in place, or rename it (a rename pins it too): pinned ids are kept in
+`proxy-config.json` and the generated ones are recomputed around them.
 
 | Provider | Catalog endpoint |
 |---|---|
@@ -265,19 +268,29 @@ since anything paid there is already covered by Go — and routes each model bac
 to the base it came from. At the time of writing that is 45 models, 8 of them
 free.
 
-### Renaming and filtering
+### The Models table
 
-Hover an id in the Models tab and click the pencil to rename it —
-`claude-sonnet-3-my-favourite` instead of `claude-sonnet-3-4`, say. The name
-still has to start with one of the five families, since anything else is
-rejected by the app; an id already taken by another model is refused too.
+Each provider card lists what it serves, twelve rows at a time:
 
-Uncheck models you do not want in the picker; with everything checked, no list
-is written and the whole catalog applies.
+| Column | |
+|---|---|
+| ☑ | Whether the model is exposed. Unticked means no id and nothing in the picker. |
+| **name in Claude Desktop** | What the picker shows. Defaults to the provider's own model name; click the pencil to change it. |
+| **model on …** | The upstream name, as the provider reports it. |
+| **id in Claude Desktop** | The generated id. The pencil edits it — still inside one of the five families. |
+| 🔓 | Pin the id so the renumbering leaves it alone. |
+| **cost / map** | `$in / $out` per million tokens, or the `static map` tag. |
 
-Whenever the ids change — a provider added models, you renamed one, you turned
-discovery on — re-run **Export to Claude Desktop** and import it again, so the
-app's list and the proxy agree.
+Click any of the three text headers to sort by it: ascending, descending, then
+back to the catalog order. Above the cards, a search box matches names, models
+and ids, and the selects filter by provider, selection, price, family, id
+origin and mapping.
+
+Whenever the ids change — a provider added models, you ticked or unticked
+something, you renamed one — re-run **Export to Claude Desktop** and import it
+again, so the app's list and the proxy agree. The export carries only the
+models that are ticked, from providers whose discovery is on: anything else
+would be an entry the proxy cannot answer.
 
 ---
 

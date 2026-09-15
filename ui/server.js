@@ -203,7 +203,7 @@ function writeConfig(cfg) {
   if (Array.isArray(cfg.customProviders) && cfg.customProviders.length) {
     clean.customProviders = cfg.customProviders;
   }
-  for (const field of ["discovery", "catalogEnabled", "catalogIds"]) {
+  for (const field of ["discovery", "catalogEnabled", "catalogIds", "catalogLabels"]) {
     const value = cfg[field];
     if (value && typeof value === "object" && Object.keys(value).length) clean[field] = value;
   }
@@ -445,8 +445,14 @@ function familyForCost(cost) {
   return "opus";
 }
 
+// Ten ids per version: claude-opus-3, claude-opus-3-1 … claude-opus-3-9,
+// then claude-opus-4 and so on. Keeps any single version readable.
+const PER_VERSION = 10;
+
 function familyId(family, n) {
-  return n === 0 ? "claude-" + family + "-" + FAMILY_START : "claude-" + family + "-" + FAMILY_START + "-" + n;
+  const version = FAMILY_START + Math.floor(n / PER_VERSION);
+  const slot = n % PER_VERSION;
+  return slot === 0 ? "claude-" + family + "-" + version : "claude-" + family + "-" + version + "-" + slot;
 }
 
 // Numbering runs across every provider at once, in the proxy's order, so the
@@ -477,8 +483,10 @@ function assignIds(cards, costsFor, cfg) {
 
     for (const model of card.models) {
       if (allow && !allow.has(model)) {
-        // Not exposed, but the table still needs something to show.
-        out[card.key][model] = renamed[model] || familyId(familyForCost(costs[model]), counters[familyForCost(costs[model])]);
+        // Not exposed means not published: it has no id at all, unless one was
+        // pinned for it. Showing the next free id here would duplicate what an
+        // exposed model is about to get.
+        out[card.key][model] = renamed[model] || "";
         continue;
       }
       let id = typeof renamed[model] === "string" && /^claude-/.test(renamed[model]) ? renamed[model] : null;
@@ -1255,6 +1263,7 @@ const server = http.createServer((req, res) => {
           ids: {}, // filled in by assignIds() once every card is known
           // Ids the user pinned by hand, so the panel can mark them.
           pinned: overrides,
+          labels: (cfg.catalogLabels && cfg.catalogLabels[p.key]) || {},
           // Only for models models.dev knows about; absent means "no data".
           pricing: Object.fromEntries(state.models.filter((m) => costs[m]).map((m) => [m, costs[m]])),
           surfaces: state.surfaces || {},
@@ -1306,6 +1315,21 @@ const server = http.createServer((req, res) => {
         cfg.catalogIds = { ...(cfg.catalogIds || {}) };
         if (Object.keys(ids).length) cfg.catalogIds[provider] = ids;
         else delete cfg.catalogIds[provider];
+      }
+
+      // Display names are a Claude Desktop concern only - the proxy never
+      // reads them - but they belong with the rest of the model settings.
+      if ("labels" in body) {
+        const labels = {};
+        for (const [model, raw] of Object.entries(body.labels || {})) {
+          if (typeof model !== "string" || typeof raw !== "string") continue;
+          const label = raw.trim().slice(0, 80);
+          if (!label || label === model) continue; // same as the default → nothing to store
+          labels[model] = label;
+        }
+        cfg.catalogLabels = { ...(cfg.catalogLabels || {}) };
+        if (Object.keys(labels).length) cfg.catalogLabels[provider] = labels;
+        else delete cfg.catalogLabels[provider];
       }
 
       try {
@@ -1473,7 +1497,7 @@ const server = http.createServer((req, res) => {
       cfg.customProviders = next;
       // Anything pinned to or configured for it would dangle otherwise.
       if (cfg.provider === key) delete cfg.provider;
-      for (const field of ["discovery", "catalogEnabled", "catalogIds"]) {
+      for (const field of ["discovery", "catalogEnabled", "catalogIds", "catalogLabels"]) {
         if (cfg[field] && typeof cfg[field] === "object") delete cfg[field][key];
       }
 

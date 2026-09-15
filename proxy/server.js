@@ -378,8 +378,14 @@ function familyFor(provider, model) {
   return "opus";
 }
 
+// Ten ids per version: claude-opus-3, claude-opus-3-1 … claude-opus-3-9,
+// then claude-opus-4 and so on. Keeps any single version readable.
+const PER_VERSION = 10;
+
 function familyId(family, n) {
-  return n === 0 ? `claude-${family}-${FAMILY_START}` : `claude-${family}-${FAMILY_START}-${n}`;
+  const version = FAMILY_START + Math.floor(n / PER_VERSION);
+  const slot = n % PER_VERSION;
+  return slot === 0 ? `claude-${family}-${version}` : `claude-${family}-${version}-${slot}`;
 }
 
 // Google lists image, music, speech and agent-only models next to the chat

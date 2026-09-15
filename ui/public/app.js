@@ -437,7 +437,12 @@ function sortModels(p, models, on) {
     if (!c) return Number.POSITIVE_INFINITY; // unpriced models sort last either way
     return c.free ? 0 : Number(c.input) || 0;
   };
-  const value = (m) => (st.col === "model" ? m.toLowerCase() : st.col === "id" ? String(p.ids[m] || "").toLowerCase() : cost(m));
+  const value = (m) => {
+    if (st.col === "model") return m.toLowerCase();
+    if (st.col === "id") return String(p.ids[m] || "").toLowerCase();
+    if (st.col === "label") return String((p.labels && p.labels[m]) || m).toLowerCase();
+    return cost(m);
+  };
   return [...models].sort((a, b) => {
     const va = value(a);
     const vb = value(b);
@@ -455,7 +460,13 @@ function modelMatches(p, model, filters, on) {
   const id = p.ids[model] || "";
   const cost = (p.pricing && p.pricing[model]) || null;
 
-  if (filters.search && !model.toLowerCase().includes(filters.search) && !id.toLowerCase().includes(filters.search)) {
+  const label = (p.labels && p.labels[model]) || model;
+  if (
+    filters.search &&
+    !model.toLowerCase().includes(filters.search) &&
+    !id.toLowerCase().includes(filters.search) &&
+    !label.toLowerCase().includes(filters.search)
+  ) {
     return false;
   }
   if (filters.status === "on" && !on.has(model)) return false;
@@ -627,6 +638,7 @@ function providerCard(p, live, isActive, filters) {
         "tr",
         { class: checked ? "" : "off", "data-model": m },
         el("td", { class: "tight" }, box),
+        labelCell(p, m),
         el(
           "td",
           {},
@@ -634,6 +646,7 @@ function providerCard(p, live, isActive, filters) {
           cost && cost.free ? el("span", { class: "tag ok", style: "margin-left:8px" }, "free") : null
         ),
         idCell(p, m),
+        lockCell(p, m),
         el(
           "td",
           {},
@@ -679,12 +692,14 @@ function providerCard(p, live, isActive, filters) {
           "tr",
           {},
           el("th", { style: "width:44px" }, ""),
+          header("label", "name in Claude Desktop"),
           header("model", "model on " + p.label),
           header("id", "id in Claude Desktop"),
+          el("th", { style: "width:44px", title: "Pin an id so it is not renumbered" }, ""),
           header("cost", "cost / map")
         )
       ),
-      el("tbody", {}, ...(rows.length ? rows : [el("tr", {}, el("td", { colspan: "4", class: "empty" }, "Nothing matches the filters."))]))
+      el("tbody", {}, ...(rows.length ? rows : [el("tr", {}, el("td", { colspan: "6", class: "empty" }, "Nothing matches the filters."))]))
     )
   );
 
@@ -717,6 +732,100 @@ function providerCard(p, live, isActive, filters) {
   return card;
 }
 
+// The display name is what Claude Desktop shows in its picker. It defaults to
+// the provider's own model name and is edited the same way as the id.
+function labelCell(p, model) {
+  const td = el("td", { class: "idcell" });
+
+  const paint = () => {
+    const label = (p.labels && p.labels[model]) || model;
+    const custom = Boolean(p.labels && p.labels[model]);
+    td.replaceChildren(
+      el(
+        "span",
+        { class: "idview" + (custom ? " custom" : "") },
+        el("span", { class: "idsuf" }, label),
+        el("button", { class: "pencil", title: "rename", onclick: edit }, "\u270e")
+      )
+    );
+  };
+
+  function edit() {
+    const input = el("input", {
+      type: "text",
+      class: "idinput",
+      value: (p.labels && p.labels[model]) || model,
+      spellcheck: "false",
+    });
+    td.replaceChildren(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = (save) => {
+      if (done) return;
+      done = true;
+      if (!save) return paint();
+      const value = input.value.trim().slice(0, 80);
+      p.labels = { ...(p.labels || {}) };
+      p.editedLabels = { ...(p.editedLabels || {}) };
+      if (!value || value === model) {
+        delete p.labels[model];
+        p.editedLabels[model] = model; // an explicit reset back to the default
+      } else {
+        p.labels[model] = value;
+        p.editedLabels[model] = value;
+      }
+      paint();
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") finish(true);
+      if (e.key === "Escape") finish(false);
+    });
+    input.addEventListener("blur", () => finish(true));
+  }
+
+  paint();
+  return td;
+}
+
+// The lock decides whether an id survives the renumbering that happens every
+// time the selection changes. Unlocked is the default.
+function lockCell(p, model) {
+  const td = el("td", { class: "tight" });
+
+  const paint = () => {
+    const locked = Boolean(p.pinned && p.pinned[model]);
+    const btn = el(
+      "button",
+      {
+        class: "lock" + (locked ? " on" : ""),
+        type: "button",
+        disabled: !locked && !p.ids[model],
+        title: locked
+          ? "Id pinned — it stays put when the numbering is redone. Click to release."
+          : "Id is renumbered automatically. Click to pin it.",
+        onclick: () => {
+          p.pinned = { ...(p.pinned || {}) };
+          p.edited = { ...(p.edited || {}) };
+          if (locked) {
+            delete p.pinned[model];
+            p.edited[model] = "";  // empty means "drop the pin on save"
+          } else {
+            p.pinned[model] = p.ids[model];
+            p.edited[model] = p.ids[model];
+          }
+          paint();
+        },
+      },
+      locked ? "\u{1F512}" : "\u{1F513}"
+    );
+    td.replaceChildren(btn);
+  };
+
+  paint();
+  return td;
+}
+
 // The id cell: a fixed "claude-" prefix plus an editable suffix. The pencil
 // only shows on hover (CSS); clicking it swaps the text for an input.
 function idCell(p, model) {
@@ -725,6 +834,12 @@ function idCell(p, model) {
   const paint = () => {
     const id = p.ids[model] || "";
     const custom = Boolean(p.pinned && p.pinned[model]);
+    if (!id) {
+      // Not exposed, so it has no id: showing the next free one would collide
+      // with whatever exposed model is about to take it.
+      td.replaceChildren(el("span", { class: "idnone", title: "not exposed \u2014 tick it to get an id" }, "\u2014"));
+      return;
+    }
     td.replaceChildren(
       el(
         "span",
@@ -812,12 +927,22 @@ async function saveSelection(p, btn) {
     const picked = p.models.filter((m) => (shown.has(m) ? boxes.find((i) => i.dataset.model === m).checked : prev.has(m)));
     const all = picked.length === p.models.length;
 
-    // Only hand-edited ids are persisted; the generated ones are recomputed.
-    const ids = { ...(p.pinned || {}), ...(p.edited || {}) };
+    // Only pinned ids are persisted; the rest are renumbered on every change.
+    // An empty string in `edited` means the pin was released.
+    const ids = {};
+    for (const [model, id] of Object.entries({ ...(p.pinned || {}), ...(p.edited || {}) })) {
+      if (id) ids[model] = id;
+    }
+    const labels = { ...(p.labels || {}), ...(p.editedLabels || {}) };
 
-    const r = await api("/api/catalog/save", { provider: p.key, enabled: all ? null : picked, ids });
+    const r = await api("/api/catalog/save", { provider: p.key, enabled: all ? null : picked, ids, labels });
     if (r.error) return toast(r.error, "err");
     p.enabled = all ? null : picked;
+    p.edited = {};
+    p.editedLabels = {};
+    // Ids are renumbered around the new selection, so reload rather than
+    // leaving the stale ones on screen.
+    await loadCatalog(false);
     const renamed = Object.keys(ids).length;
     toast(
       p.label + ": " + (all ? "whole catalog enabled" : picked.length + " models enabled") +
@@ -866,35 +991,30 @@ $("#btn-filters-reset").addEventListener("click", () => {
 });
 $("#btn-catalog-refresh").addEventListener("click", (e) => refreshCatalog(e.target));
 
-// Writing to the clipboard can be refused (no user gesture, a permission
-// prompt, a locked-down browser), so the text is always selected as a fallback
-// and the caller is told which of the two happened.
-async function copyOut(text, okMessage) {
-  const out = $("#catalog-out");
-  try {
-    await navigator.clipboard.writeText(text);
-    toast(okMessage, "ok");
-  } catch {
-    const range = document.createRange();
-    range.selectNodeContents(out);
-    const sel = window.getSelection();
-    sel.removeAllRanges();
-    sel.addRange(range);
-    toast("Could not reach the clipboard — the JSON below is selected, press Ctrl+C.", "err");
+// Claude Desktop imports the whole gateway block, not a bare array - without
+// this header the import is rejected.
+//
+// Only the models actually ticked are exported: an unchecked one is not served
+// by the proxy, so listing it would put a dead entry in the picker. The
+// checkboxes on screen win over the last saved selection, so what you see is
+// what you get.
+function liveSelection(p) {
+  const boxes = $$('#catalog-cards input[data-provider="' + p.key + '"]');
+  if (!boxes.length) return enabledSetFor(p); // card collapsed or filtered out
+  const saved = enabledSetFor(p);
+  const shown = new Set(boxes.map((b) => b.dataset.model));
+  const on = new Set();
+  for (const m of p.models) {
+    if (shown.has(m)) {
+      if (boxes.find((b) => b.dataset.model === m).checked) on.add(m);
+    } else if (saved.has(m)) {
+      on.add(m);
+    }
   }
+  return on;
 }
 
-$("#btn-catalog-copy-again").addEventListener("click", () => {
-  const text = $("#catalog-out").textContent;
-  if (!text) return;
-  copyOut(text, "JSON copied.");
-});
-
-// Claude Desktop imports the whole gateway block, not a bare array - without
-// this header the import is rejected. Labels and tiers already set in the app
-// are preserved for ids it already knows.
-$("#btn-catalog-copy").addEventListener("click", async () => {
-  const known = (catalog.desktop && catalog.desktop.models) || {};
+function buildExportPayload() {
   const seen = new Set();
   const inferenceModels = [];
 
@@ -906,50 +1026,62 @@ $("#btn-catalog-copy").addEventListener("click", async () => {
   });
 
   for (const p of order) {
-    // Only what the proxy actually publishes: a provider with discovery off
-    // serves none of these ids, so exporting them would fill the picker with
-    // entries that quietly fall back to something else.
+    // A provider with discovery off publishes nothing from its catalog, so
+    // exporting its models would fill the picker with entries that 404.
     if (!p.hasKey || !p.discovery) continue;
-    const on = enabledSetFor(p);
+    const on = liveSelection(p);
     for (const m of p.models) {
       if (!on.has(m)) continue;
       const name = p.ids[m];
-      if (!name) continue;
-      if (seen.has(name)) continue;
+      if (!name || seen.has(name)) continue;
       seen.add(name);
-      const prev = known[name] || {};
-      // The tier follows the family already encoded in the id; fable and
-      // mythos have no tier of their own, so they ride along as sonnet.
-      const family = (name.match(/^claude-(haiku|sonnet|opus)-/) || [])[1] || "sonnet";
-      const entry = {
+      const family = (name.match(/^claude-(haiku|sonnet|opus)\b/) || [])[1] || "sonnet";
+      inferenceModels.push({
         name,
-        labelOverride: prev.labelOverride || m,
-        anthropicFamilyTier: prev.anthropicFamilyTier || family,
-      };
-      if (prev.isFamilyDefault) entry.isFamilyDefault = true;
-      inferenceModels.push(entry);
+        labelOverride: (p.labels && p.labels[m]) || m,
+        anthropicFamilyTier: family,
+      });
     }
   }
 
-  const payload = {
+  return {
     inferenceGatewayBaseUrl: "https://localhost:" + (catalog.port || 8877),
     inferenceGatewayApiKey: (catalog.desktop && catalog.desktop.apiKey) || "proxy-local-key",
     modelDiscoveryEnabled: false,
     inferenceModels,
   };
+}
 
-  const text = JSON.stringify(payload, null, 2);
+async function copyText(text, okMsg) {
   const out = $("#catalog-out");
-  out.hidden = false;
-  out.textContent = text;
-  $("#catalog-out-actions").hidden = false;
-  const sources = catalog.providers.filter((p) => p.hasKey && p.discovery).map((p) => p.label);
-  await copyOut(
-    text,
-    inferenceModels.length
-      ? "Config copied — " + inferenceModels.length + " models from " + sources.join(", ") + "."
-      : "Nothing to export: turn discovery on for a provider first."
-  );
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMsg, "ok");
+  } catch {
+    // Clipboard access can be refused; select the fallback so Ctrl+C works.
+    const range = document.createRange();
+    range.selectNodeContents(out);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    toast("Could not reach the clipboard — the JSON below is selected, press Ctrl+C.", "err");
+  }
+}
+
+$("#btn-catalog-copy").addEventListener("click", async () => {
+  const payload = buildExportPayload();
+  const text = JSON.stringify(payload, null, 2);
+  $("#catalog-out").textContent = text;
+  $("#export-box").hidden = false;
+  $("#export-count").textContent =
+    payload.inferenceModels.length + " selected model" + (payload.inferenceModels.length === 1 ? "" : "s");
+  await copyText(text, "Config copied (" + payload.inferenceModels.length + " models).");
+});
+
+$("#btn-copy-out").addEventListener("click", async () => {
+  const text = $("#catalog-out").textContent;
+  if (!text.trim()) return toast("Nothing to copy yet.", "err");
+  await copyText(text, "Copied.");
 });
 
 // ── logs ─────────────────────────────────────────────────
