@@ -866,6 +866,30 @@ $("#btn-filters-reset").addEventListener("click", () => {
 });
 $("#btn-catalog-refresh").addEventListener("click", (e) => refreshCatalog(e.target));
 
+// Writing to the clipboard can be refused (no user gesture, a permission
+// prompt, a locked-down browser), so the text is always selected as a fallback
+// and the caller is told which of the two happened.
+async function copyOut(text, okMessage) {
+  const out = $("#catalog-out");
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMessage, "ok");
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents(out);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    toast("Could not reach the clipboard — the JSON below is selected, press Ctrl+C.", "err");
+  }
+}
+
+$("#btn-catalog-copy-again").addEventListener("click", () => {
+  const text = $("#catalog-out").textContent;
+  if (!text) return;
+  copyOut(text, "JSON copied.");
+});
+
 // Claude Desktop imports the whole gateway block, not a bare array - without
 // this header the import is rejected. Labels and tiers already set in the app
 // are preserved for ids it already knows.
@@ -882,7 +906,10 @@ $("#btn-catalog-copy").addEventListener("click", async () => {
   });
 
   for (const p of order) {
-    if (!p.hasKey) continue;
+    // Only what the proxy actually publishes: a provider with discovery off
+    // serves none of these ids, so exporting them would fill the picker with
+    // entries that quietly fall back to something else.
+    if (!p.hasKey || !p.discovery) continue;
     const on = enabledSetFor(p);
     for (const m of p.models) {
       if (!on.has(m)) continue;
@@ -893,7 +920,7 @@ $("#btn-catalog-copy").addEventListener("click", async () => {
       const prev = known[name] || {};
       // The tier follows the family already encoded in the id; fable and
       // mythos have no tier of their own, so they ride along as sonnet.
-      const family = (name.match(/^claude-(haiku|sonnet|opus)/) || [])[1] || "sonnet";
+      const family = (name.match(/^claude-(haiku|sonnet|opus)-/) || [])[1] || "sonnet";
       const entry = {
         name,
         labelOverride: prev.labelOverride || m,
@@ -915,18 +942,14 @@ $("#btn-catalog-copy").addEventListener("click", async () => {
   const out = $("#catalog-out");
   out.hidden = false;
   out.textContent = text;
-  try {
-    await navigator.clipboard.writeText(text);
-    toast("Config copied (" + inferenceModels.length + " models).", "ok");
-  } catch {
-    // Clipboard access can be refused; select the fallback so Ctrl+C works.
-    const range = document.createRange();
-    range.selectNodeContents(out);
-    const sel = window.getSelection();
-    sel.removeAllRanges();
-    sel.addRange(range);
-    toast("Could not reach the clipboard — the JSON below is selected, press Ctrl+C.", "err");
-  }
+  $("#catalog-out-actions").hidden = false;
+  const sources = catalog.providers.filter((p) => p.hasKey && p.discovery).map((p) => p.label);
+  await copyOut(
+    text,
+    inferenceModels.length
+      ? "Config copied — " + inferenceModels.length + " models from " + sources.join(", ") + "."
+      : "Nothing to export: turn discovery on for a provider first."
+  );
 });
 
 // ── logs ─────────────────────────────────────────────────
