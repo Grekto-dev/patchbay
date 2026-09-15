@@ -35,3 +35,6 @@ logs/
 
 # Overrides locais escritos pelo painel (ui/)
 proxy-config.json
+
+# Certificate backups (private keys — never commit)
+*.pem.*
