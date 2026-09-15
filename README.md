@@ -138,10 +138,10 @@ Fill in:
 | Gateway API key | `proxy-local-key` |
 | Auth scheme | `Bearer` |
 
-Then the **model list**. Either add entries by hand — any id starting with
-`claude-` is accepted, and the display name and tier are up to you — or use the
-panel's **Export to Claude Desktop** button (Models tab), which copies a
-ready-to-import block:
+Then the **model list**. Either add entries by hand — the id has to belong to
+one of the Anthropic families (see [Model ids](#model-ids)), while the display
+name is free — or use the panel's **Export to Claude Desktop** button (Models
+tab), which copies a ready-to-import block:
 
 ```json
 {
@@ -149,7 +149,7 @@ ready-to-import block:
   "inferenceGatewayApiKey": "proxy-local-key",
   "modelDiscoveryEnabled": false,
   "inferenceModels": [
-    { "name": "claude-kimi-k3", "labelOverride": "kimi-k3", "anthropicFamilyTier": "sonnet" }
+    { "name": "claude-opus-3", "labelOverride": "kimi-k3", "anthropicFamilyTier": "opus" }
   ]
 }
 ```
@@ -196,17 +196,32 @@ PROXY_ROOT=/path/to/other/patchbay node ui/server.js
 
 ## Models
 
-### Where the lists come from
+### Model ids
 
-Claude Desktop accepts **any** model id beginning with `claude-`, and resolves
-the display name, the tier and the 1M-context variants on its own side. So the
-proxy does not need a curated list — it only needs to know which ids to accept
-and where to send them.
+Claude Desktop only accepts ids in its own families — **haiku, sonnet, opus,
+fable, mythos** — but it does not care about the version part: `claude-sonnet-3`
+and `claude-sonnet-3-7` are both fine. The display name and the tier are
+resolved on its side, so the proxy only needs to agree with it on which ids
+exist and where each one points.
 
-With **discovery** on for a provider, the proxy asks it for its catalog at
-startup and every 30 minutes, then publishes each model as `claude-<slug>`:
-`kimi-k2.5` becomes `claude-kimi-k2-5`, `glm-5.3-flash` becomes
-`claude-glm-5-3-flash`.
+Patchbay handles that naming itself. With **discovery** on for a provider, it
+asks for the catalog at startup and every 30 minutes, then publishes each model
+as `claude-<family>-3`, `claude-<family>-3-1`, `claude-<family>-3-2`, … The
+family comes from the price per million input tokens:
+
+| Family | When |
+|---|---|
+| `haiku` | free, or at most $0.30/M |
+| `sonnet` | up to $2/M |
+| `opus` | above $2/M |
+| `fable` | no pricing data — a local endpoint, an unlisted model |
+
+So `big-pickle` (free) becomes `claude-haiku-3-16`, `kimi-k3` ($3/M) becomes
+`claude-opus-3`. The numbering is global: every provider draws from the same
+counters, so two of them never collide in the one list Claude Desktop sees.
+
+Ids you edit by hand are kept in `proxy-config.json` and survive every refresh;
+the generated ones are recomputed around them.
 
 | Provider | Catalog endpoint |
 |---|---|
@@ -252,10 +267,17 @@ free.
 
 ### Renaming and filtering
 
-Hover an id in the Models tab and click the pencil to rename it. The `claude-`
-prefix is fixed, the rest is slugified, and an id already used by another model
-is refused. Uncheck models you do not want in the picker; with everything
-checked, no list is written and the whole catalog applies.
+Hover an id in the Models tab and click the pencil to rename it —
+`claude-sonnet-3-my-favourite` instead of `claude-sonnet-3-4`, say. The name
+still has to start with one of the five families, since anything else is
+rejected by the app; an id already taken by another model is refused too.
+
+Uncheck models you do not want in the picker; with everything checked, no list
+is written and the whole catalog applies.
+
+Whenever the ids change — a provider added models, you renamed one, you turned
+discovery on — re-run **Export to Claude Desktop** and import it again, so the
+app's list and the proxy agree.
 
 ---
 
@@ -479,7 +501,8 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 |---|---|
 | `ERR_CERT_AUTHORITY_INVALID` | The CA is not trusted yet. Diagnostics → **Install CA in the system**, or run `certs\install-ca.ps1` / `./certs/install-ca.sh`. |
 | "server is busy" loop in Claude Desktop | The proxy is not running. Start it from the panel. |
-| Model missing from the picker | The id must start with `claude-`. Add it under **Configure third-party inference**, or enable `modelDiscoveryEnabled`. |
+| Model missing from the picker | The id must be in one of the families (haiku, sonnet, opus, fable, mythos). Add it under **Configure third-party inference**, or enable `modelDiscoveryEnabled`. |
+| Every model answers as the same one | The app's list was imported before the ids changed, so its entries no longer match. Re-export from the Models tab and import again. |
 | `MissingSessionID` from OpenCode | OpenCode requires an `x-opencode-session` header; the proxy sends one. Seeing this means an older `proxy/server.js` is running. |
 | `Model … is not supported` (OpenCode) | The model lives on the other OpenCode surface. Enable discovery so the proxy learns which base each model belongs to. |
 | `429 quota exceeded` (Google) | Gemini Pro models are not available on the free AI Studio tier. Use a Flash model or enable billing. |
@@ -510,6 +533,9 @@ prints a health check, a probe test and a malformed-payload test.
 - **Catalogs are cached.** 30 minutes in the proxy, 5 minutes in the panel
   (12 hours for pricing). Use **Refresh** when a provider has just shipped
   something.
+- **Generated ids can shift.** They are assigned in order, so a provider adding
+  or dropping models renumbers what comes after it. Rename the ones you rely on
+  — pinned ids never move — or re-export after a catalog change.
 - **Config changes need a restart.** The proxy reads `proxy-config.json` and
   `.env` at startup; the panel shows a banner and a one-click restart.
 - **The panel only logs proxies it started.** An externally started proxy is

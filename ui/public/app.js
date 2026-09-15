@@ -379,8 +379,12 @@ function renderDiag(s) {
 
 let catalog = { providers: [], port: 8877, desktop: {} };
 
-function claudeIdFor(m) {
-  return "claude-" + String(m).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+// Claude Desktop only accepts these families; the version part is free-form.
+const ID_FAMILIES = ["haiku", "sonnet", "opus", "fable", "mythos"];
+
+function inAcceptedFamily(id) {
+  const suffix = String(id).replace(/^claude-/, "");
+  return ID_FAMILIES.some((f) => suffix === f || suffix.startsWith(f + "-"));
 }
 
 function enabledSetFor(p) {
@@ -587,8 +591,8 @@ function idCell(p, model) {
   const td = el("td", { class: "idcell" });
 
   const paint = () => {
-    const id = p.ids[model] || claudeIdFor(model);
-    const custom = id !== claudeIdFor(model);
+    const id = p.ids[model] || "";
+    const custom = Boolean(p.pinned && p.pinned[model]);
     td.replaceChildren(
       el(
         "span",
@@ -611,6 +615,10 @@ function idCell(p, model) {
       return paint();
     }
     const next = "claude-" + suffix;
+    if (!inAcceptedFamily(next)) {
+      toast("Claude Desktop only accepts " + ID_FAMILIES.join(", ") + " — try claude-sonnet-3-mine.", "err");
+      return paint();
+    }
     // Ids have to be unique across every provider: Claude Desktop sees one list.
     for (const other of catalog.providers) {
       const clash = Object.entries(other.ids).find(([m, id]) => id === next && !(other.key === p.key && m === model));
@@ -620,11 +628,13 @@ function idCell(p, model) {
       }
     }
     p.ids[model] = next;
+    p.pinned = { ...(p.pinned || {}), [model]: next };
+    p.edited = { ...(p.edited || {}), [model]: next };
     paint();
   };
 
   function edit() {
-    const id = p.ids[model] || claudeIdFor(model);
+    const id = p.ids[model] || "";
     const input = el("input", { type: "text", class: "idinput", value: id.replace(/^claude-/, ""), spellcheck: "false" });
     td.replaceChildren(el("span", { class: "idedit" }, el("span", { class: "idfix" }, "claude-"), input));
     input.focus();
@@ -670,11 +680,8 @@ async function saveSelection(p, btn) {
     const picked = p.models.filter((m) => (shown.has(m) ? boxes.find((i) => i.dataset.model === m).checked : prev.has(m)));
     const all = picked.length === p.models.length;
 
-    const ids = {};
-    for (const m of p.models) {
-      const id = p.ids[m];
-      if (id && id !== claudeIdFor(m)) ids[m] = id;
-    }
+    // Only hand-edited ids are persisted; the generated ones are recomputed.
+    const ids = { ...(p.pinned || {}), ...(p.edited || {}) };
 
     const r = await api("/api/catalog/save", { provider: p.key, enabled: all ? null : picked, ids });
     if (r.error) return toast(r.error, "err");
@@ -735,14 +742,18 @@ $("#btn-catalog-copy").addEventListener("click", async () => {
     const on = enabledSetFor(p);
     for (const m of p.models) {
       if (!on.has(m)) continue;
-      const name = p.ids[m] || claudeIdFor(m);
+      const name = p.ids[m];
+      if (!name) continue;
       if (seen.has(name)) continue;
       seen.add(name);
       const prev = known[name] || {};
+      // The tier follows the family already encoded in the id; fable and
+      // mythos have no tier of their own, so they ride along as sonnet.
+      const family = (name.match(/^claude-(haiku|sonnet|opus)/) || [])[1] || "sonnet";
       const entry = {
         name,
         labelOverride: prev.labelOverride || m,
-        anthropicFamilyTier: prev.anthropicFamilyTier || "sonnet",
+        anthropicFamilyTier: prev.anthropicFamilyTier || family,
       };
       if (prev.isFamilyDefault) entry.isFamilyDefault = true;
       inferenceModels.push(entry);

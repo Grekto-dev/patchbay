@@ -278,19 +278,25 @@ function anyDiscoveryOn() {
 // Which models are free. The provider APIs do not say, so this comes from
 // models.dev (OpenCode's own model database): free means input and output both
 // cost 0. Only needed for sources marked `freeOnly`.
-const FREE_PRICING_SOURCES = { opencode: ["opencode-go", "opencode"] };
+const PRICING_SOURCES = {
+  opencode: ["opencode-go", "opencode"],
+  deepseek: ["deepseek"],
+  glm: ["zai-coding-plan", "zai", "zhipuai-coding-plan", "zhipuai"],
+  gemini: ["google"],
+};
 const FREE_TTL_MS = 12 * 60 * 60 * 1000;
-const freeModels = { byProvider: {}, fetchedAt: 0, ok: false };
+// { provider: { model: { free, input, output } } } - drives both the free-only
+// filter and the family a generated id lands in.
+const pricing = { byProvider: {}, fetchedAt: 0, ok: false };
 
-function needsFreeData() {
-  return Object.entries(CATALOG_SOURCES).some(
-    ([provider, spec]) => discoveryOn(provider) && (spec.sources || []).some((src) => src.freeOnly)
-  );
+function needsPricing() {
+  // Any provider being discovered benefits: cost decides the id family.
+  return Object.keys(CATALOG_SOURCES).some(discoveryOn);
 }
 
-function refreshFreeModels(cb) {
+function refreshPricing(cb) {
   const done = cb || (() => {});
-  if (freeModels.fetchedAt && Date.now() - freeModels.fetchedAt < FREE_TTL_MS) return done();
+  if (pricing.fetchedAt && Date.now() - pricing.fetchedAt < FREE_TTL_MS) return done();
 
   const req = https.request(
     { hostname: "models.dev", port: 443, path: "/api.json", method: "GET", timeout: 25000, headers: { "User-Agent": "claude-desktop-proxy" } },
@@ -301,23 +307,27 @@ function refreshFreeModels(cb) {
         try {
           const db = JSON.parse(Buffer.concat(chunks).toString("utf8"));
           const byProvider = {};
-          for (const [provider, sources] of Object.entries(FREE_PRICING_SOURCES)) {
-            const free = new Set();
-            for (const source of sources) {
+          for (const [provider, sources] of Object.entries(PRICING_SOURCES)) {
+            const costs = {};
+            // Earlier sources win, so a provider's own catalog beats a generic one.
+            for (const source of [...sources].reverse()) {
               const models = (db[source] && db[source].models) || {};
               for (const [id, m] of Object.entries(models)) {
                 const cost = m.cost || {};
-                if (Number(cost.input) === 0 && Number(cost.output) === 0) free.add(id);
+                const input = Number(cost.input);
+                const output = Number(cost.output);
+                if (!Number.isFinite(input) || !Number.isFinite(output)) continue;
+                costs[id] = { free: input === 0 && output === 0, input, output };
               }
             }
-            byProvider[provider] = free;
+            byProvider[provider] = costs;
           }
-          freeModels.byProvider = byProvider;
-          freeModels.fetchedAt = Date.now();
-          freeModels.ok = true;
-          console.log(`[proxy] [CATALOG] models.dev: free models known (${Object.values(byProvider).reduce((n, s) => n + s.size, 0)})`);
+          pricing.byProvider = byProvider;
+          pricing.fetchedAt = Date.now();
+          pricing.ok = true;
+          console.log(`[proxy] [CATALOG] models.dev: pricing for ${Object.values(byProvider).reduce((n, c) => n + Object.keys(c).length, 0)} models`);
         } catch (e) {
-          freeModels.ok = false;
+          pricing.ok = false;
           console.error("[proxy] [CATALOG] models.dev unusable, falling back to the -free suffix:", e.message);
         }
         done();
@@ -325,23 +335,51 @@ function refreshFreeModels(cb) {
     }
   );
   req.on("error", (e) => {
-    freeModels.ok = false;
+    pricing.ok = false;
     console.error("[proxy] [CATALOG] models.dev unreachable, falling back to the -free suffix:", e.message);
     done();
   });
   req.on("timeout", () => {
     req.destroy();
-    freeModels.ok = false;
+    pricing.ok = false;
     done();
   });
   req.end();
 }
 
 // With models.dev unavailable, the naming convention is the best guess left.
+function costOf(provider, model) {
+  const costs = pricing.byProvider[provider];
+  return (costs && costs[model]) || null;
+}
+
 function isFreeModel(provider, model) {
-  const set = freeModels.byProvider[provider];
-  if (freeModels.ok && set) return set.has(model);
+  const cost = costOf(provider, model);
+  if (cost) return cost.free;
   return /-free$/.test(model);
+}
+
+// ── Generated model ids ──────────────────────────────────
+// Claude Desktop only accepts ids in the Anthropic families; the version part
+// is free-form. So a discovered model is published as claude-<family>-3,
+// claude-<family>-3-1, ... with the family chosen by price: the cheap ones
+// land in haiku, the mid range in sonnet, the expensive in opus, and anything
+// with no price at all (a local endpoint, an unlisted model) in fable.
+const ID_FAMILIES = ["haiku", "sonnet", "opus", "fable", "mythos"];
+const FAMILY_START = 3;
+const HAIKU_MAX_INPUT = 0.3; // $/M tokens
+const SONNET_MAX_INPUT = 2;
+
+function familyFor(provider, model) {
+  const cost = costOf(provider, model);
+  if (!cost) return "fable";
+  if (cost.free || cost.input <= HAIKU_MAX_INPUT) return "haiku";
+  if (cost.input <= SONNET_MAX_INPUT) return "sonnet";
+  return "opus";
+}
+
+function familyId(family, n) {
+  return n === 0 ? `claude-${family}-${FAMILY_START}` : `claude-${family}-${FAMILY_START}-${n}`;
 }
 
 // Google lists image, music, speech and agent-only models next to the chat
@@ -371,14 +409,57 @@ function portFor(ep) {
   return ep.scheme === "http" ? 80 : 443;
 }
 
-function claudeIdFor(upstreamModel) {
-  const slug = String(upstreamModel).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return "claude-" + slug;
-}
+// Generated ids are rebuilt as a whole so the numbering does not depend on
+// which catalog answered first.
+const generatedIds = {}; // provider → { claudeId: upstreamModel }
 
-// Ids written by hand in proxy-config.json must survive a catalog refresh.
-function pinnedIdsFor(provider) {
-  return new Set(Object.keys((OVERRIDES.models && OVERRIDES.models[provider]) || {}));
+function rebuildGeneratedIds() {
+  const counters = Object.fromEntries(ID_FAMILIES.map((f) => [f, 0]));
+  const taken = new Set();
+
+  // Ids pinned by hand, in proxy-config.json, are reserved before anything else.
+  for (const [provider, map] of Object.entries(CATALOG_IDS)) {
+    if (!map || typeof map !== "object") continue;
+    for (const id of Object.values(map)) if (typeof id === "string") taken.add(id);
+  }
+  for (const ep of Object.values(ENDPOINTS)) {
+    for (const id of Object.keys((OVERRIDES.models && OVERRIDES.models[ep.key]) || {})) taken.add(id);
+  }
+
+  let total = 0;
+  // A fixed provider order keeps the numbering stable across restarts.
+  for (const provider of TEXT_PROVIDER_PRIORITY) {
+    const ep = ENDPOINTS[provider];
+    const state = CATALOGS[provider];
+    if (!ep || !ep.modelMap || !state) continue;
+
+    // Drop the previous generation before assigning again.
+    for (const id of Object.keys(generatedIds[provider] || {})) delete ep.modelMap[id];
+    generatedIds[provider] = {};
+    if (!discoveryOn(provider)) continue;
+
+    const allow = Array.isArray(CATALOG_ENABLED[provider]) ? new Set(CATALOG_ENABLED[provider]) : null;
+    const renamed = CATALOG_IDS[provider] && typeof CATALOG_IDS[provider] === "object" ? CATALOG_IDS[provider] : {};
+
+    for (const model of state.models) {
+      if (allow && !allow.has(model)) continue;
+
+      const custom = typeof renamed[model] === "string" && /^claude-/.test(renamed[model]) ? renamed[model] : null;
+      let id = custom;
+      if (!id) {
+        const family = familyFor(provider, model);
+        do {
+          id = familyId(family, counters[family]++);
+        } while (taken.has(id));
+      }
+      if (taken.has(id) && !custom) continue;
+      taken.add(id);
+      ep.modelMap[id] = model;
+      generatedIds[provider][id] = model;
+      total++;
+    }
+  }
+  return total;
 }
 
 function applyCatalog(provider, models, chatPaths) {
@@ -390,25 +471,7 @@ function applyCatalog(provider, models, chatPaths) {
   for (const [model, chatPath] of Object.entries(chatPaths || {})) {
     if (chatPath) ep.modelBase[model] = chatPath;
   }
-  const allow = Array.isArray(CATALOG_ENABLED[provider]) ? new Set(CATALOG_ENABLED[provider]) : null;
-  const renamed = CATALOG_IDS[provider] && typeof CATALOG_IDS[provider] === "object" ? CATALOG_IDS[provider] : {};
-  const pinned = pinnedIdsFor(provider);
-  const taken = new Map(); // claude id → upstream model
-  let added = 0;
-
-  for (const model of models) {
-    if (allow && !allow.has(model)) continue;
-    const custom = typeof renamed[model] === "string" && /^claude-/.test(renamed[model]) ? renamed[model] : null;
-    let id = custom || claudeIdFor(model);
-    if (pinned.has(id)) continue; // an explicit map entry wins
-    const base = id;
-    let n = 2;
-    while (taken.has(id) && taken.get(id) !== model) id = base + "-" + n++;
-    taken.set(id, model);
-    if (ep.modelMap[id] !== model) added++;
-    ep.modelMap[id] = model;
-  }
-  return added;
+  return rebuildGeneratedIds();
 }
 
 function fetchModelList(provider, sourceIndex, cb) {
@@ -446,6 +509,17 @@ function fetchModelList(provider, sourceIndex, cb) {
         let models = null;
         try {
           const json = JSON.parse(d);
+          if (source.parse === "openrouter") {
+            // OpenRouter prices its own catalog, in dollars per token.
+            const costs = {};
+            for (const m of json.data || []) {
+              const input = Number(m.pricing && m.pricing.prompt) * 1e6;
+              const output = Number(m.pricing && m.pricing.completion) * 1e6;
+              if (!Number.isFinite(input) || !Number.isFinite(output)) continue;
+              costs[m.id] = { free: input === 0 && output === 0, input, output };
+            }
+            pricing.byProvider.openrouter = costs;
+          }
           models =
             source.parse === "openrouter"
               ? // Keep the text-only models; the rest also emit images or audio.
@@ -529,13 +603,13 @@ function refreshCatalog(provider, cb) {
     state.fetchedAt = Date.now();
     state.error = null;
     const added = applyCatalog(provider, models, chatPaths);
-    console.log(`[proxy] [CATALOG] ${ep.label}: ${models.length} models (${added} new claude-* ids)`);
+    console.log(`[proxy] [CATALOG] ${ep.label}: ${models.length} models (${added} ids published)`);
     done(state);
   });
 }
 
 function refreshAllCatalogs() {
-  if (needsFreeData()) return refreshFreeModels(() => refreshCatalogs());
+  if (needsPricing()) return refreshPricing(() => refreshCatalogs());
   refreshCatalogs();
 }
 

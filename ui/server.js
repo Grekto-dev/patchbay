@@ -427,8 +427,72 @@ function isTextModel(id) {
   return !NON_TEXT_MODEL.test(s) && !DEPRECATED_MODEL.test(s);
 }
 
-function claudeIdFor(upstreamModel) {
-  return "claude-" + String(upstreamModel).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+// Claude Desktop only accepts ids in the Anthropic families; the version part
+// is free-form. Discovered models are published as claude-<family>-3,
+// claude-<family>-3-1, ... with the family chosen by price: cheap ones land in
+// haiku, the mid range in sonnet, the expensive in opus, and anything with no
+// price at all (a local endpoint, an unlisted model) in fable. Kept in step
+// with the same block in proxy/server.js.
+const ID_FAMILIES = ["haiku", "sonnet", "opus", "fable", "mythos"];
+const FAMILY_START = 3;
+const HAIKU_MAX_INPUT = 0.3; // $/M tokens
+const SONNET_MAX_INPUT = 2;
+
+function familyForCost(cost) {
+  if (!cost) return "fable";
+  if (cost.free || cost.input <= HAIKU_MAX_INPUT) return "haiku";
+  if (cost.input <= SONNET_MAX_INPUT) return "sonnet";
+  return "opus";
+}
+
+function familyId(family, n) {
+  return n === 0 ? "claude-" + family + "-" + FAMILY_START : "claude-" + family + "-" + FAMILY_START + "-" + n;
+}
+
+// Numbering runs across every provider at once, in the proxy's order, so the
+// panel shows exactly the ids the proxy will publish.
+function assignIds(cards, costsFor, cfg) {
+  const counters = Object.fromEntries(ID_FAMILIES.map((f) => [f, 0]));
+  const taken = new Set();
+  const renamedAll = cfg.catalogIds && typeof cfg.catalogIds === "object" ? cfg.catalogIds : {};
+  const enabledAll = cfg.catalogEnabled && typeof cfg.catalogEnabled === "object" ? cfg.catalogEnabled : {};
+
+  for (const map of Object.values(renamedAll)) {
+    if (map && typeof map === "object") for (const id of Object.values(map)) taken.add(id);
+  }
+  for (const map of Object.values((cfg.models && typeof cfg.models === "object" && cfg.models) || {})) {
+    if (map && typeof map === "object") for (const id of Object.keys(map)) taken.add(id);
+  }
+
+  const out = {};
+  // Discovery-on providers first and in order: those are the ones the proxy
+  // actually numbers. The rest are numbered afterwards, as a preview.
+  const ordered = [...cards].sort((a, b) => Number(Boolean(b.discovery)) - Number(Boolean(a.discovery)));
+
+  for (const card of ordered) {
+    const renamed = renamedAll[card.key] || {};
+    const allow = Array.isArray(enabledAll[card.key]) ? new Set(enabledAll[card.key]) : null;
+    const costs = costsFor(card.key);
+    out[card.key] = {};
+
+    for (const model of card.models) {
+      if (allow && !allow.has(model)) {
+        // Not exposed, but the table still needs something to show.
+        out[card.key][model] = renamed[model] || familyId(familyForCost(costs[model]), counters[familyForCost(costs[model])]);
+        continue;
+      }
+      let id = typeof renamed[model] === "string" && /^claude-/.test(renamed[model]) ? renamed[model] : null;
+      if (!id) {
+        const family = familyForCost(costs[model]);
+        do {
+          id = familyId(family, counters[family]++);
+        } while (taken.has(id));
+      }
+      taken.add(id);
+      out[card.key][model] = id;
+    }
+  }
+  return out;
 }
 
 // Claude Desktop only accepts ids starting with "claude-", so the prefix is
@@ -439,7 +503,11 @@ function sanitizeClaudeId(raw) {
     .replace(/^claude-/, "")
     .replace(/[^a-z0-9.-]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return suffix ? "claude-" + suffix : "";
+  if (!suffix) return "";
+  // The app rejects anything outside its own families, so a rename has to keep
+  // one of them: claude-sonnet-4-fast is fine, claude-my-model is not.
+  const family = ID_FAMILIES.find((f) => suffix === f || suffix.startsWith(f + "-"));
+  return family ? "claude-" + suffix : "";
 }
 
 function envKeyFor(provider) {
@@ -1165,13 +1233,15 @@ const server = http.createServer((req, res) => {
       const ids = cfg.catalogIds && typeof cfg.catalogIds === "object" ? cfg.catalogIds : {};
       const env = readEnvFile();
 
-      const cards = providers()
+      const costsByProvider = {};
+      const rawCards = providers()
         .filter((p) => catalogSourcesFor(p.key))
         .map((p) => {
         const state = catalogState(p.key);
         const overrides = ids[p.key] && typeof ids[p.key] === "object" ? ids[p.key] : {};
         // A provider that reports its own pricing beats the models.dev copy.
         const costs = { ...(pricing.byProvider[p.key] || {}), ...(state.pricing || {}) };
+        costsByProvider[p.key] = costs;
         return {
           key: p.key,
           label: p.label,
@@ -1182,7 +1252,9 @@ const server = http.createServer((req, res) => {
           discovery: discovery[p.key] === true,
           models: state.models,
           enabled: Array.isArray(enabled[p.key]) ? enabled[p.key] : null,
-          ids: Object.fromEntries(state.models.map((m) => [m, overrides[m] || claudeIdFor(m)])),
+          ids: {}, // filled in by assignIds() once every card is known
+          // Ids the user pinned by hand, so the panel can mark them.
+          pinned: overrides,
           // Only for models models.dev knows about; absent means "no data".
           pricing: Object.fromEntries(state.models.filter((m) => costs[m]).map((m) => [m, costs[m]])),
           surfaces: state.surfaces || {},
@@ -1190,6 +1262,9 @@ const server = http.createServer((req, res) => {
           error: state.error,
         };
       });
+
+      const assigned = assignIds(rawCards, (key) => costsByProvider[key] || {}, cfg);
+      const cards = rawCards.map((c) => ({ ...c, ids: assigned[c.key] || {} }));
 
       sendJSON(res, 200, {
         providers: cards,
@@ -1225,7 +1300,7 @@ const server = http.createServer((req, res) => {
         for (const [model, rawId] of Object.entries(body.ids || {})) {
           if (typeof model !== "string" || typeof rawId !== "string") continue;
           const id = sanitizeClaudeId(rawId);
-          if (!id || id === claudeIdFor(model)) continue; // same as generated → no override
+          if (!id) continue; // outside the families Claude Desktop accepts
           ids[model] = id;
         }
         cfg.catalogIds = { ...(cfg.catalogIds || {}) };
