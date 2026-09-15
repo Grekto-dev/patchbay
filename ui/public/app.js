@@ -391,6 +391,94 @@ function enabledSetFor(p) {
   return p.enabled === null ? new Set(p.models) : new Set(p.enabled);
 }
 
+// ── filtering and sorting ────────────────────────────────
+
+const FILTER_IDS = {
+  search: "#catalog-search",
+  provider: "#f-provider",
+  status: "#f-status",
+  price: "#f-price",
+  family: "#f-family",
+  origin: "#f-origin",
+  mapping: "#f-mapping",
+};
+
+function readFilters() {
+  const f = {};
+  for (const [key, sel] of Object.entries(FILTER_IDS)) {
+    const node = $(sel);
+    f[key] = node ? node.value : key === "search" ? "" : "all";
+  }
+  f.search = (f.search || "").trim().toLowerCase();
+  return f;
+}
+
+function familyOf(id) {
+  return (String(id).match(/^claude-(haiku|sonnet|opus|fable|mythos)\b/) || [])[1] || "";
+}
+
+// Sorting is per provider card: { providerKey: { col, dir } }, dir 1 | -1.
+// A third click clears the entry and the catalog order comes back.
+const sortState = {};
+
+function cycleSort(providerKey, col) {
+  const cur = sortState[providerKey];
+  if (!cur || cur.col !== col) sortState[providerKey] = { col, dir: 1 };
+  else if (cur.dir === 1) cur.dir = -1;
+  else delete sortState[providerKey];
+  renderCatalog();
+}
+
+function sortModels(p, models, on) {
+  const st = sortState[p.key];
+  if (!st) return models;
+  const cost = (m) => {
+    const c = p.pricing && p.pricing[m];
+    if (!c) return Number.POSITIVE_INFINITY; // unpriced models sort last either way
+    return c.free ? 0 : Number(c.input) || 0;
+  };
+  const value = (m) => (st.col === "model" ? m.toLowerCase() : st.col === "id" ? String(p.ids[m] || "").toLowerCase() : cost(m));
+  return [...models].sort((a, b) => {
+    const va = value(a);
+    const vb = value(b);
+    if (va === vb) return a.localeCompare(b);
+    if (typeof va === "number" && typeof vb === "number") {
+      if (!Number.isFinite(va)) return 1; // keep "no price" at the bottom
+      if (!Number.isFinite(vb)) return -1;
+      return (va - vb) * st.dir;
+    }
+    return String(va).localeCompare(String(vb)) * st.dir;
+  });
+}
+
+function modelMatches(p, model, filters, on) {
+  const id = p.ids[model] || "";
+  const cost = (p.pricing && p.pricing[model]) || null;
+
+  if (filters.search && !model.toLowerCase().includes(filters.search) && !id.toLowerCase().includes(filters.search)) {
+    return false;
+  }
+  if (filters.status === "on" && !on.has(model)) return false;
+  if (filters.status === "off" && on.has(model)) return false;
+
+  if (filters.price === "free" && !(cost && cost.free)) return false;
+  if (filters.price === "paid" && !(cost && !cost.free)) return false;
+  if (filters.price === "cheap" && !(cost && (cost.free || Number(cost.input) < 1))) return false;
+  if (filters.price === "unknown" && cost) return false;
+
+  if (filters.family !== "all" && familyOf(id) !== filters.family) return false;
+
+  const pinned = Boolean(p.pinned && p.pinned[model]);
+  if (filters.origin === "pinned" && !pinned) return false;
+  if (filters.origin === "auto" && pinned) return false;
+
+  const mapped = isStaticallyMapped(p.key, model);
+  if (filters.mapping === "static" && !mapped) return false;
+  if (filters.mapping === "discovered" && mapped) return false;
+
+  return true;
+}
+
 // A model already mapped by hand in proxy/server.js for this provider.
 function isStaticallyMapped(providerKey, upstreamModel) {
   const map = (state && state.models && state.models[providerKey]) || {};
@@ -410,11 +498,36 @@ function renderCatalog() {
 
   const upstream = (state && state.proxy.upstream && state.proxy.upstream.catalog) || {};
   const active = state && state.activeProvider;
+  const filters = readFilters();
 
+  syncProviderFilter();
+
+  const shown = filters.provider === "all" ? catalog.providers : catalog.providers.filter((p) => p.key === filters.provider);
   setChildren(
     $("#catalog-cards"),
-    catalog.providers.map((p) => providerCard(p, upstream[p.key], p.key === active))
+    shown.map((p) => providerCard(p, upstream[p.key], p.key === active, filters))
   );
+
+  const matching = $$("#catalog-cards tbody tr[data-model]").length;
+  const known = catalog.providers.reduce((n, p) => n + p.models.length, 0);
+  const filtering = filters.search || Object.entries(filters).some(([k, v]) => k !== "search" && v !== "all");
+  $("#filter-count").textContent = filtering ? matching + " of " + known + " models match" : known + " models";
+  $("#btn-filters-reset").disabled = !filtering;
+}
+
+// The provider select follows whatever providers exist right now.
+function syncProviderFilter() {
+  const sel = $("#f-provider");
+  if (!sel) return;
+  const want = ["all", ...catalog.providers.map((p) => p.key)].join(",");
+  if (sel.dataset.rendered === want) return;
+  const current = sel.value;
+  sel.replaceChildren(
+    el("option", { value: "all" }, "all"),
+    ...catalog.providers.map((p) => el("option", { value: p.key }, p.label))
+  );
+  sel.dataset.rendered = want;
+  sel.value = [...sel.options].some((o) => o.value === current) ? current : "all";
 }
 
 // Collapsed state is a per-viewer convenience, so it lives in localStorage.
@@ -436,9 +549,8 @@ function setCollapsed(key, value) {
   }
 }
 
-function providerCard(p, live, isActive) {
+function providerCard(p, live, isActive, filters) {
   const on = enabledSetFor(p);
-  const filter = $("#catalog-filter").value.trim().toLowerCase();
   const freeCount = p.models.filter((m) => p.pricing && p.pricing[m] && p.pricing[m].free).length;
 
   const discovery = el("input", { type: "checkbox", checked: p.discovery, disabled: !p.hasKey });
@@ -506,15 +618,14 @@ function providerCard(p, live, isActive) {
     return el("div", { class: "card" }, head);
   }
 
-  const rows = p.models
-    .filter((m) => !filter || m.includes(filter) || (p.ids[m] || "").includes(filter))
-    .map((m) => {
+  const visible = sortModels(p, p.models.filter((m) => modelMatches(p, m, filters, on)), on);
+  const rows = visible.map((m) => {
       const checked = on.has(m);
       const cost = p.pricing && p.pricing[m];
       const box = el("input", { type: "checkbox", "data-model": m, "data-provider": p.key, checked: checked });
       const tr = el(
         "tr",
-        { class: checked ? "" : "off" },
+        { class: checked ? "" : "off", "data-model": m },
         el("td", { class: "tight" }, box),
         el(
           "td",
@@ -538,9 +649,23 @@ function providerCard(p, live, isActive) {
         syncMaster();
       });
       return tr;
-    });
+  });
 
   // Twelve rows fit; the rest scrolls inside the card instead of stretching it.
+  const st = sortState[p.key];
+  const header = (col, label) => {
+    const arrow = st && st.col === col ? (st.dir === 1 ? " \u25b4" : " \u25be") : "";
+    return el(
+      "th",
+      {
+        class: "sortable" + (st && st.col === col ? " sorted" : ""),
+        title: "Sort by " + label + " — click again to reverse, once more for the catalog order",
+        onclick: () => cycleSort(p.key, col),
+      },
+      label + arrow
+    );
+  };
+
   const table = el(
     "div",
     { class: "table-scroll model-window" },
@@ -550,9 +675,16 @@ function providerCard(p, live, isActive) {
       el(
         "thead",
         {},
-        el("tr", {}, el("th", { style: "width:44px" }, ""), el("th", {}, "model on " + p.label), el("th", {}, "id in Claude Desktop"), el("th", {}, "cost / map"))
+        el(
+          "tr",
+          {},
+          el("th", { style: "width:44px" }, ""),
+          header("model", "model on " + p.label),
+          header("id", "id in Claude Desktop"),
+          header("cost", "cost / map")
+        )
       ),
-      el("tbody", {}, ...(rows.length ? rows : [el("tr", {}, el("td", { colspan: "4", class: "empty" }, "Nothing matches the filter."))]))
+      el("tbody", {}, ...(rows.length ? rows : [el("tr", {}, el("td", { colspan: "4", class: "empty" }, "Nothing matches the filters."))]))
     )
   );
 
@@ -719,7 +851,19 @@ function refreshCatalog(btn) {
   });
 }
 
-$("#catalog-filter").addEventListener("input", renderCatalog);
+for (const sel of Object.values(FILTER_IDS)) {
+  const node = $(sel);
+  if (node) node.addEventListener(node.tagName === "SELECT" ? "change" : "input", renderCatalog);
+}
+
+$("#btn-filters-reset").addEventListener("click", () => {
+  for (const [key, sel] of Object.entries(FILTER_IDS)) {
+    const node = $(sel);
+    if (node) node.value = key === "search" ? "" : "all";
+  }
+  for (const key of Object.keys(sortState)) delete sortState[key];
+  renderCatalog();
+});
 $("#btn-catalog-refresh").addEventListener("click", (e) => refreshCatalog(e.target));
 
 // Claude Desktop imports the whole gateway block, not a bare array - without

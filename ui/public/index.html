@@ -159,21 +159,80 @@
           <h2>Models by provider</h2>
           <p class="hint">
             With <b>discovery</b> on, the proxy asks that provider for its model list at startup
-            (and every 30 min) and publishes each model as a <code class="inline-code">claude-…</code>
-            id — which is all Claude Desktop requires. With it off, only the static maps in
-            <code class="inline-code">proxy/server.js</code> apply. Uncheck anything you do not want
-            in the model picker; with everything checked no list is written and the whole catalog
-            applies. Hover an id to rename it — the <code class="inline-code">claude-</code> prefix
-            is required and stays fixed.
+            (and every 30 min) and names each model automatically — <code class="inline-code">haiku</code>
+            for the free and cheap ones, <code class="inline-code">sonnet</code> up to $2/M,
+            <code class="inline-code">opus</code> above that, <code class="inline-code">fable</code>
+            when there is no price data. Those are the families Claude Desktop accepts; the version
+            part is free. With discovery off, only the static maps in
+            <code class="inline-code">proxy/server.js</code> apply. Uncheck anything you do not want in
+            the model picker, and hover an id to rename it — a rename is kept across refreshes.
           </p>
         </div>
         <button class="sm ghost" id="btn-catalog-refresh">Refresh all</button>
       </div>
-      <div class="log-toolbar">
-        <input type="text" id="catalog-filter" placeholder="filter models…">
-        <span class="spacer"></span>
-        <button class="sm ghost" id="btn-catalog-copy">Export to Claude Desktop</button>
+      <div class="filters">
+        <div class="filter-search">
+          <input type="search" id="catalog-search" placeholder="search a model or an id…" autocomplete="off" spellcheck="false">
+          <button class="sm ghost" id="btn-filters-reset">Reset</button>
+          <span class="spacer"></span>
+          <button class="sm ghost" id="btn-catalog-copy">Export to Claude Desktop</button>
+        </div>
+
+        <div class="filter-grid">
+          <label class="filter-field">
+            <span>Provider</span>
+            <select id="f-provider"><option value="all">all</option></select>
+          </label>
+          <label class="filter-field">
+            <span>Selection</span>
+            <select id="f-status">
+              <option value="all">all</option>
+              <option value="on">exposed</option>
+              <option value="off">not exposed</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span>Price</span>
+            <select id="f-price">
+              <option value="all">all</option>
+              <option value="free">free only</option>
+              <option value="paid">paid only</option>
+              <option value="cheap">under $1/M</option>
+              <option value="unknown">no price data</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span>Family</span>
+            <select id="f-family">
+              <option value="all">all</option>
+              <option value="haiku">haiku</option>
+              <option value="sonnet">sonnet</option>
+              <option value="opus">opus</option>
+              <option value="fable">fable</option>
+              <option value="mythos">mythos</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span>Id</span>
+            <select id="f-origin">
+              <option value="all">all</option>
+              <option value="auto">generated</option>
+              <option value="pinned">renamed by hand</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span>Mapping</span>
+            <select id="f-mapping">
+              <option value="all">all</option>
+              <option value="static">in the static map</option>
+              <option value="discovered">discovered only</option>
+            </select>
+          </label>
+        </div>
+
+        <p class="hint filter-count" id="filter-count"></p>
       </div>
+
       <p class="hint" id="pricing-note" style="margin:12px 0 0"></p>
       <pre class="out" id="catalog-out" hidden></pre>
     </div>

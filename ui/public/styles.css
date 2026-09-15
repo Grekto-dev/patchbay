@@ -226,7 +226,7 @@ button.rm {
 }
 button.rm:hover:not(:disabled) { color: #ffb4ae; border-color: #4a2320; background: #2a1917; }
 
-input[type="text"], input[type="password"], input[type="number"], select {
+input[type="text"], input[type="password"], input[type="number"], input[type="search"], select {
   width: 100%;
   font: inherit;
   font-size: 13px;
@@ -259,6 +259,49 @@ select { font-family: inherit; cursor: pointer; }
 
 td.tight { width: 44px; }
 tr.off td:not(.tight) { opacity: .45; }
+
+/* ── filter bar ─────────────────────────────── */
+
+.filters {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--bg);
+}
+.filter-search { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.filter-search .spacer { flex: 1; }
+.filter-search input[type="search"] {
+  flex: 1;
+  min-width: 200px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.filter-field { display: flex; flex-direction: column; gap: 4px; }
+.filter-field > span {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  font-weight: 600;
+}
+.filter-field select { font-size: 12.5px; padding: 6px 9px; }
+.filter-count { margin: 12px 0 0 !important; font-variant-numeric: tabular-nums; }
+
+/* sortable column headers */
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+  transition: color .12s;
+}
+th.sortable:hover { color: var(--text); }
+th.sorted { color: var(--accent); }
 
 /* collapsible provider card */
 .collapser {
