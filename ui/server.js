@@ -460,6 +460,12 @@ function familyId(family, n) {
 function assignIds(cards, costsFor, cfg) {
   const counters = Object.fromEntries(ID_FAMILIES.map((f) => [f, 0]));
   const taken = new Set();
+
+  // Same reservation the proxy makes: the ids in the static maps are spoken
+  // for, so a generated one must skip them.
+  for (const map of Object.values(defaultModelMaps())) {
+    for (const id of Object.keys(map || {})) taken.add(id);
+  }
   const renamedAll = cfg.catalogIds && typeof cfg.catalogIds === "object" ? cfg.catalogIds : {};
   const enabledAll = cfg.catalogEnabled && typeof cfg.catalogEnabled === "object" ? cfg.catalogEnabled : {};
 
@@ -568,7 +574,8 @@ function fetchProviderList(provider, key, index, cb) {
             for (const m of json.data || []) {
               const inCost = Number(m.pricing && m.pricing.prompt) * 1e6;
               const outCost = Number(m.pricing && m.pricing.completion) * 1e6;
-              if (!Number.isFinite(inCost) || !Number.isFinite(outCost)) continue;
+              // A negative price means "varies" (the auto routers), not free.
+              if (!Number.isFinite(inCost) || !Number.isFinite(outCost) || inCost < 0 || outCost < 0) continue;
               sourcePricing[m.id] = {
                 free: inCost === 0 && outCost === 0,
                 input: Number(inCost.toFixed(4)),

@@ -419,9 +419,24 @@ function portFor(ep) {
 // which catalog answered first.
 const generatedIds = {}; // provider → { claudeId: upstreamModel }
 
+// Ids are handed out in this order, always. It deliberately ignores
+// TEXT_PROVIDER_PRIORITY, which gets reordered when a provider is pinned, and
+// mirrors the panel's provider list so both sides generate the same ids.
+function idOrder() {
+  const builtins = ["opencode", "openrouter", "glm", "deepseek", "gemini"];
+  return [
+    ...builtins.filter((k) => ENDPOINTS[k]),
+    ...Object.keys(ENDPOINTS).filter((k) => ENDPOINTS[k].custom),
+  ];
+}
+
 function rebuildGeneratedIds() {
   const counters = Object.fromEntries(ID_FAMILIES.map((f) => [f, 0]));
   const taken = new Set();
+
+  // The canonical ids belong to the static maps: a generated id must never
+  // land on one, or a discovered model would quietly take over claude-sonnet-4-5.
+  for (const id of CANONICAL_IDS) taken.add(id);
 
   // Ids pinned by hand, in proxy-config.json, are reserved before anything else.
   for (const [provider, map] of Object.entries(CATALOG_IDS)) {
@@ -433,8 +448,7 @@ function rebuildGeneratedIds() {
   }
 
   let total = 0;
-  // A fixed provider order keeps the numbering stable across restarts.
-  for (const provider of TEXT_PROVIDER_PRIORITY) {
+  for (const provider of idOrder()) {
     const ep = ENDPOINTS[provider];
     const state = CATALOGS[provider];
     if (!ep || !ep.modelMap || !state) continue;
@@ -521,7 +535,8 @@ function fetchModelList(provider, sourceIndex, cb) {
             for (const m of json.data || []) {
               const input = Number(m.pricing && m.pricing.prompt) * 1e6;
               const output = Number(m.pricing && m.pricing.completion) * 1e6;
-              if (!Number.isFinite(input) || !Number.isFinite(output)) continue;
+              // A negative price means "varies" (the auto routers), not free.
+              if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0) continue;
               costs[m.id] = { free: input === 0 && output === 0, input, output };
             }
             pricing.byProvider.openrouter = costs;
@@ -697,18 +712,21 @@ function resolveEndpoint(parsed) {
   }
   // Unknown model id: fall back to whichever text provider is actually configured,
   // instead of always DeepSeek (which may have no API key set).
-  // Unknown id: hand it to whichever provider is active. A custom endpoint has
-  // no built-in default, so fall back to the first model it reported.
-  const fallbackKey = getPrimaryTextEndpoint();
-  const fallbackEp = ENDPOINTS[fallbackKey];
-  const catalog = CATALOGS[fallbackKey];
-  const fallbackModel = fallbackEp.defaultModel || (catalog && catalog.models[0]) || "";
-  return {
-    key: fallbackKey,
-    ep: fallbackEp,
-    upstreamModel: fallbackModel,
-    directGemini: fallbackKey === "gemini",
-  };
+  // An id that names an upstream model directly (gemini-3.8-flash, kimi-k3) is
+  // honoured when a ready provider actually serves it - handy for a model list
+  // written before the claude-* ids existed.
+  for (const key of TEXT_PROVIDER_PRIORITY) {
+    if (!providerReady(key)) continue;
+    const state = CATALOGS[key];
+    if (state && state.models.includes(origModel)) {
+      return { key, ep: ENDPOINTS[key], upstreamModel: origModel, directGemini: key === "gemini" };
+    }
+  }
+
+  // Nothing matches. Answering with the active provider's default would send a
+  // request meant for one model to a completely different one, which is worse
+  // than failing: it looks like it worked.
+  return { key: null, ep: null, upstreamModel: "", unknownModel: true };
 }
 
 function cleanSchema(obj) {
@@ -1575,9 +1593,9 @@ function handleRequest(req, res) {
 
     const origModel = parsed.model || "unknown";
     const origMaxTokens = parsed.max_tokens;
-    const { key: epKey, ep, upstreamModel, directGemini } = resolveEndpoint(parsed);
+    const { key: epKey, ep, upstreamModel, directGemini, unknownModel } = resolveEndpoint(parsed);
 
-    console.log(`[proxy] incoming: model=${origModel}, max_tokens=${origMaxTokens}, stream=${!!parsed.stream}, endpoint=${epKey}`);
+    console.log(`[proxy] incoming: model=${origModel}, max_tokens=${origMaxTokens}, stream=${!!parsed.stream}, endpoint=${epKey || "none"}`);
 
     // ── INTERCEPT PROBES ──────────────────────────────
     if (origMaxTokens !== undefined && origMaxTokens <= 1 && !parsed.stream) {
@@ -1596,16 +1614,21 @@ function handleRequest(req, res) {
       return res.end(JSON.stringify(probeResp));
     }
 
-    if (!upstreamModel) {
-      console.error(`[proxy] no model available on ${ep.label} for ${origModel}`);
-      res.writeHead(400, { "Content-Type": "application/json" });
+    if (unknownModel || !ep || !upstreamModel) {
+      const ready = Object.keys(ENDPOINTS)
+        .filter((k) => providerReady(k) && ENDPOINTS[k].modelMap)
+        .map((k) => ENDPOINTS[k].label)
+        .join(", ");
+      console.error(`[proxy] ✖ unknown model "${origModel}" — no provider serves it`);
+      res.writeHead(404, { "Content-Type": "application/json" });
       return res.end(
         JSON.stringify({
           type: "error",
           error: {
             message:
-              `No model on ${ep.label} matches "${origModel}". Turn discovery on for it, ` +
-              `or map the id in proxy-config.json.`,
+              `No configured provider serves "${origModel}". Configured: ${ready || "none"}. ` +
+              `Re-export the model list from the Patchbay panel (Models → Export to Claude Desktop) ` +
+              `so Claude Desktop uses the ids the proxy actually publishes.`,
           },
         })
       );
