@@ -73,7 +73,7 @@ directly when it is also the text backend, through an OCR hand-off otherwise.
 ## Quick start
 
 ```bash
-git clone https://github.com/Grekto-dev/claude-desktop-proxy.git patchbay
+git clone https://github.com/Grekto-dev/patchbay.git
 cd patchbay
 ```
 
