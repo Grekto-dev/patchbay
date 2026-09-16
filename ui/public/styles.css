@@ -257,7 +257,9 @@ select { font-family: inherit; cursor: pointer; }
 .switch input:indeterminate + span { color: var(--text-dim); }
 .switch input:disabled { opacity: .4; cursor: not-allowed; }
 
-td.tight { width: 44px; }
+td.tight, th.tight { width: 44px; }
+.selall { cursor: pointer; }
+.selall:disabled { opacity: .4; cursor: not-allowed; }
 tr.off td:not(.tight) { opacity: .45; }
 
 /* ── filter bar ─────────────────────────────── */

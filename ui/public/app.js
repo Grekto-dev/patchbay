@@ -567,9 +567,15 @@ function providerCard(p, live, isActive, filters) {
   const discovery = el("input", { type: "checkbox", checked: p.discovery, disabled: !p.hasKey });
   discovery.addEventListener("change", () => saveCatalog(p, { discovery: discovery.checked }, discovery));
 
-  // Master switch: flips every model of this provider at once. Half-checked
+  // Header checkbox of the first column: flips every model listed for this
+  // provider at once (what the filters hide is left alone). Half-checked
   // whenever only some of them are on.
-  const master = el("input", { type: "checkbox", disabled: !p.hasKey || !p.models.length });
+  const master = el("input", {
+    type: "checkbox",
+    class: "selall",
+    title: "Select or clear every model listed here",
+    disabled: !p.hasKey || !p.models.length,
+  });
 
   const syncMaster = () => {
     const boxes = $$('#catalog-cards input[data-provider="' + p.key + '"]');
@@ -618,7 +624,6 @@ function providerCard(p, live, isActive, filters) {
           : "Add " + p.env + " on the Keys tab to pull this catalog."
       )
     ),
-    el("label", { class: "switch" }, master, el("span", {}, "select all")),
     el("label", { class: "switch" }, discovery, el("span", {}, "discovery"))
   );
 
@@ -691,7 +696,7 @@ function providerCard(p, live, isActive, filters) {
         el(
           "tr",
           {},
-          el("th", { style: "width:44px" }, ""),
+          el("th", { class: "tight", title: "Select or clear every model listed here" }, master),
           header("label", "name in Claude Desktop"),
           header("model", "model on " + p.label),
           header("id", "id in Claude Desktop"),
