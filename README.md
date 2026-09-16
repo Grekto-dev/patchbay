@@ -175,9 +175,9 @@ and reopen it. Your models are in the picker.
 |---|---|
 | **Status** | Proxy up/down, active backend, request / probe / image / error counters, per-backend split, and a checklist of what is still missing. |
 | **Keys & provider** | Write or remove API keys (stored in `.env`, shown masked), pin a text provider instead of relying on priority, change the proxy port. |
-| **Models** | One card per provider: toggle discovery, pick which models to expose, rename their ids, export the Claude Desktop config. |
+| **Models** | One card per provider: switch the provider on or off, toggle discovery, pick which models to expose (with a live counter and a select-all in the table header), rename their ids, export the Claude Desktop config. |
 | **Live logs** | The proxy's output, colour-coded and filterable — requests, images, probes, errors. |
-| **Diagnostics** | Generate certificates, install the CA, write `developer_settings.json`, run the connectivity test. |
+| **Diagnostics** | Certificate status and chain, install / reissue / remove the CA, write `developer_settings.json`, run the connectivity test. |
 
 Start / Stop / Restart run the proxy as a child process, which is how its output
 reaches the log tab. A proxy started elsewhere (`start.bat`, a scheduled task)
@@ -291,6 +291,19 @@ something, you renamed one — re-run **Export to Claude Desktop** and import it
 again, so the app's list and the proxy agree. The export carries only the
 models that are ticked, from providers whose discovery is on: anything else
 would be an entry the proxy cannot answer.
+
+### Switching a provider off
+
+The **provider** switch in a card's header takes the whole provider out of
+circulation: nothing is routed to it, its catalog is not fetched, none of its
+ids are published, and the remaining providers are renumbered around it. The
+key stays in `.env` and the model selection is kept, so flipping it back
+restores exactly what was there — it is written as `providersOff` in
+`proxy-config.json`, and like every other setting it needs a proxy restart.
+
+Useful when a provider is rate-limited, down, or simply in the way: switching
+it off is reversible and leaves no half-configured state behind. Re-export the
+model list afterwards, since the ids of everything else move.
 
 ---
 
@@ -430,6 +443,9 @@ Delete it to return to the built-in defaults. Nothing here rewrites
     "opencode": true,
     "gemini": true
   },
+  "providersOff": {                   // switched off entirely: no routing, no ids
+    "deepseek": true
+  },
   "catalogEnabled": {                 // omit a provider to expose its whole catalog
     "deepseek": ["deepseek-v4-pro"]
   },
@@ -486,7 +502,7 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 ├── ui/
 │   ├── server.js            Control panel server (no dependencies)
 │   └── public/              Panel front-end
-├── certs/                   Certificate generation and CA install scripts
+├── certs/                   Certificate generation, CA install and uninstall scripts
 └── mcp-gemini-vision/       Optional MCP server for Gemini vision (from upstream)
 ```
 
@@ -503,8 +519,10 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 - Client-supplied `x-api-key` headers are not forwarded upstream.
 - Request bodies are capped at 50 MB and validated as JSON.
 - The TLS certificate is generated locally and the CA is installed only in your
-  own trust store. Claude Desktop rejects a self-signed certificate without
-  `CA:TRUE`, which is why a small local CA exists at all.
+  own trust store (`CurrentUser\Root` on Windows — no administrator rights).
+  Claude Desktop rejects a self-signed certificate without `CA:TRUE`, which is
+  why a small local CA exists at all. Diagnostics → **Remove CA** takes it back
+  out whenever you want; the PEM files under `certs/` are left alone.
 
 ---
 
@@ -512,7 +530,7 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 
 | Symptom | Cause and fix |
 |---|---|
-| `ERR_CERT_AUTHORITY_INVALID` | The CA is not trusted yet. Diagnostics → **Install CA in the system**, or run `certs\install-ca.ps1` / `./certs/install-ca.sh`. |
+| `ERR_CERT_AUTHORITY_INVALID` | The CA is not trusted yet, or the server certificate no longer chains to it. Diagnostics shows both as their own row; **Install CA** trusts it, **Reissue & reinstall** replaces the pair when the chain is broken. |
 | "server is busy" loop in Claude Desktop | The proxy is not running. Start it from the panel. |
 | Model missing from the picker | The id must be in one of the families (haiku, sonnet, opus, fable, mythos). Add it under **Configure third-party inference**, or enable `modelDiscoveryEnabled`. |
 | Every model answers as the same one | The app's list was imported before the ids changed, so its entries no longer match. Re-export from the Models tab and import again. |

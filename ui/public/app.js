@@ -194,6 +194,14 @@ function renderChecklist(s) {
     txt: gem && gem.set ? "Google AI Studio key configured (images/OCR)" : "Add the Google AI Studio key (used for images/OCR)",
   });
   items.push({ ok: s.certs.ok, txt: s.certs.ok ? "TLS certificates present" : "Generate the certificates on the Diagnostics tab" });
+  // A present certificate the OS does not trust fails exactly like a missing one.
+  const trusted = s.certs.trust && s.certs.trust.trusted;
+  if (s.certs.ok && trusted !== null) {
+    items.push({
+      ok: trusted === true,
+      txt: trusted ? "CA trusted by the system" : "Install the CA on the Diagnostics tab — the gateway is refused without it",
+    });
+  }
   items.push({
     ok: s.desktop.every((d) => d.matches),
     txt: s.desktop.every((d) => d.matches)
@@ -341,9 +349,37 @@ function renderProviders(s) {
 
 function renderDiag(s) {
   const c = s.certs;
+  const trust = c.trust || {};
+  const trusted = trust.trusted;
+
+  // Both buttons act on the trust store, so their labels follow it.
+  $("#btn-install-ca").disabled = !c.present["ca-cert.pem"] || trusted === true;
+  $("#btn-remove-ca").disabled = trusted === false;
+  $("#btn-reissue").disabled = false;
+
   setChildren($("#cert-rows"), [
     ...Object.entries(c.present).map(([f, ok]) =>
       row(f, ok ? el("span", { class: "tag ok" }, "present") : el("span", { class: "tag err" }, "missing"))
+    ),
+    c.chainOk === null
+      ? null
+      : row(
+          "Chain",
+          c.chainOk
+            ? el("span", { class: "tag ok" }, "server cert signed by the CA")
+            : el("span", { class: "tag err" }, "server cert does not chain to this CA"),
+          " ",
+          c.chainOk ? "" : "Reissue the pair — Claude Desktop rejects this with ERR_CERT_AUTHORITY_INVALID."
+        ),
+    row(
+      "Trusted by the OS",
+      trusted === true
+        ? el("span", { class: "tag ok" }, "yes")
+        : trusted === false
+        ? el("span", { class: "tag err" }, "no")
+        : el("span", { class: "tag warn" }, trust.error || "checking…"),
+      " ",
+      trust.store + (c.ca ? " · " + c.ca.thumbprint : "")
     ),
     c.expires
       ? row(
@@ -356,6 +392,7 @@ function renderDiag(s) {
         )
       : null,
     c.subject ? row("Subject", c.subject.replace(/\n/g, " · ")) : null,
+    c.ca ? row("CA", c.ca.isCa ? el("span", { class: "tag ok" }, "CA:TRUE") : el("span", { class: "tag err" }, "not a CA"), " ", c.ca.subject.replace(/\n/g, " · ")) : null,
   ]);
 
   setChildren($("#desktop-rows"), [
@@ -519,6 +556,8 @@ function renderCatalog() {
     shown.map((p) => providerCard(p, upstream[p.key], p.key === active, filters))
   );
 
+  updateSelectedTotal();
+
   const matching = $$("#catalog-cards tbody tr[data-model]").length;
   const known = catalog.providers.reduce((n, p) => n + p.models.length, 0);
   const filtering = filters.search || Object.entries(filters).some(([k, v]) => k !== "search" && v !== "all");
@@ -562,10 +601,28 @@ function setCollapsed(key, value) {
 
 function providerCard(p, live, isActive, filters) {
   const on = enabledSetFor(p);
+  const isOff = p.on === false;
   const freeCount = p.models.filter((m) => p.pricing && p.pricing[m] && p.pricing[m].free).length;
 
-  const discovery = el("input", { type: "checkbox", checked: p.discovery, disabled: !p.hasKey });
+  // Switching a provider off is stronger than clearing its models: the proxy
+  // stops routing to it, stops discovering it and publishes none of its ids -
+  // but everything it had selected is kept for when it comes back.
+  const power = el("input", { type: "checkbox", checked: !isOff });
+  power.addEventListener("change", () => saveCatalog(p, { on: power.checked }, power));
+
+  const discovery = el("input", { type: "checkbox", checked: p.discovery, disabled: !p.hasKey || isOff });
   discovery.addEventListener("change", () => saveCatalog(p, { discovery: discovery.checked }, discovery));
+
+  // How many of this provider's models are selected right now - live, so it
+  // follows the checkboxes instead of waiting for a save.
+  const counter = el("span", { class: "tag count" }, "—");
+  const syncCount = () => {
+    const picked = liveSelection(p).size;
+    counter.textContent = picked + " / " + p.models.length;
+    counter.classList.toggle("zero", picked === 0);
+    counter.title = picked + " of " + p.models.length + " models selected";
+    updateSelectedTotal();
+  };
 
   // Header checkbox of the first column: flips every model listed for this
   // provider at once (what the filters hide is left alone). Half-checked
@@ -592,7 +649,15 @@ function providerCard(p, live, isActive, filters) {
     syncMaster();
   };
 
-  master.addEventListener("change", () => setAll(master.checked));
+  const syncAll = () => {
+    syncMaster();
+    syncCount();
+  };
+
+  master.addEventListener("change", () => {
+    setAll(master.checked);
+    syncCount();
+  });
 
   const chevron = el("span", { class: "chev" }, "\u25be");
   const title = el(
@@ -600,9 +665,11 @@ function providerCard(p, live, isActive, filters) {
     { class: "collapser", type: "button" },
     chevron,
     el("span", { class: "ctitle" }, p.label),
-    isActive ? el("span", { class: "tag ok" }, "active backend") : null,
+    isOff ? el("span", { class: "tag off" }, "off") : null,
+    isActive && !isOff ? el("span", { class: "tag ok" }, "active backend") : null,
     p.hasKey ? null : el("span", { class: "tag warn" }, "no " + p.env),
-    freeCount ? el("span", { class: "tag info" }, freeCount + " free") : null
+    freeCount ? el("span", { class: "tag info" }, freeCount + " free") : null,
+    p.hasKey && p.models.length ? counter : null
   );
 
   const head = el(
@@ -615,7 +682,10 @@ function providerCard(p, live, isActive, filters) {
       el(
         "p",
         { class: "hint" },
-        p.hasKey
+        isOff
+          ? "Switched off — nothing is routed here and none of its ids are published. " +
+            (on.size && p.enabled !== null ? on.size + " selected model(s) are kept for when it comes back." : "Its selection is kept.")
+          : p.hasKey
           ? p.error
             ? "Catalog error: " + p.error
             : p.models.length + " models · fetched at " + (p.fetchedAt ? fmtTime(p.fetchedAt) : "—") +
@@ -624,8 +694,18 @@ function providerCard(p, live, isActive, filters) {
           : "Add " + p.env + " on the Keys tab to pull this catalog."
       )
     ),
+    el("label", { class: "switch" }, power, el("span", {}, "provider")),
     el("label", { class: "switch" }, discovery, el("span", {}, "discovery"))
   );
+
+  if (isOff) {
+    // A dead selection is worse than none: with no ids to show, the table
+    // would only invite edits that go nowhere.
+    chevron.style.visibility = "hidden";
+    title.style.cursor = "default";
+    queueMicrotask(syncCount);
+    return el("div", { class: "card off" }, head);
+  }
 
   if (!p.hasKey || !p.models.length) {
     // Nothing to fold away, so the chevron would be a dead control.
@@ -664,7 +744,7 @@ function providerCard(p, live, isActive, filters) {
       );
       box.addEventListener("change", () => {
         tr.classList.toggle("off", !box.checked);
-        syncMaster();
+        syncAll();
       });
       return tr;
   });
@@ -733,8 +813,25 @@ function providerCard(p, live, isActive, filters) {
     setCollapsed(p.key, next);
   });
 
-  queueMicrotask(syncMaster);
+  queueMicrotask(syncAll);
   return card;
+}
+
+// One line for the whole tab: what an export would carry right now.
+function updateSelectedTotal() {
+  const node = $("#selected-total");
+  if (!node) return;
+  let picked = 0;
+  let exported = 0;
+  for (const p of catalog.providers) {
+    if (p.on === false) continue;
+    const n = liveSelection(p).size;
+    picked += n;
+    if (p.hasKey && p.discovery) exported += n;
+  }
+  node.textContent =
+    picked + " selected · " + exported + " published by the proxy" +
+    (picked !== exported ? " (the rest sit behind discovery off)" : "");
 }
 
 // The display name is what Claude Desktop shows in its picker. It defaults to
@@ -918,6 +1015,12 @@ async function saveCatalog(p, payload, btn) {
     p.discovery = payload.discovery;
     toast(p.label + ": discovery " + (payload.discovery ? "enabled" : "disabled") + ".", "ok");
   }
+  if ("on" in payload) {
+    p.on = payload.on;
+    toast(p.label + " " + (payload.on ? "switched on." : "switched off — its ids stop working."), "ok");
+    // Every other provider is renumbered around it, so reload the ids too.
+    await loadCatalog(false);
+  }
   if (state && state.proxy.running) markRestart(true);
   refresh(true);
   return true;
@@ -1031,9 +1134,9 @@ function buildExportPayload() {
   });
 
   for (const p of order) {
-    // A provider with discovery off publishes nothing from its catalog, so
-    // exporting its models would fill the picker with entries that 404.
-    if (!p.hasKey || !p.discovery) continue;
+    // A provider with discovery off - or switched off entirely - publishes
+    // nothing, so exporting its models would fill the picker with 404s.
+    if (!p.hasKey || !p.discovery || p.on === false) continue;
     const on = liveSelection(p);
     for (const m of p.models) {
       if (!on.has(m)) continue;
@@ -1277,8 +1380,62 @@ function runScript(btn, script, outSel, okMsg) {
   });
 }
 
-$("#btn-gen-certs").addEventListener("click", (e) => runScript(e.target, "certs", "#cert-out", "Certificates generated."));
 $("#btn-install-ca").addEventListener("click", (e) => runScript(e.target, "install-ca", "#cert-out", "CA installed."));
+
+$("#btn-remove-ca").addEventListener("click", (e) => {
+  if (
+    !confirm(
+      "Remove the CA from the trust store?\n\n" +
+        "The proxy keeps running, but Claude Desktop will refuse it with ERR_CERT_AUTHORITY_INVALID " +
+        "until the CA is installed again. The certificate files are not deleted."
+    )
+  ) {
+    return;
+  }
+  runScript(e.target, "uninstall-ca", "#cert-out", "CA removed from the trust store.");
+});
+
+// Reissuing replaces the CA as well, so the old one has to go and the proxy -
+// which read the certificate once, at startup - has to be restarted.
+$("#btn-reissue").addEventListener("click", (e) => {
+  if (
+    !confirm(
+      "Reissue the certificates?\n\n" +
+        "A new CA and a new server certificate are generated, the new CA is trusted, " +
+        "and the proxy restarts. Windows asks you to confirm the trust store change."
+    )
+  ) {
+    return;
+  }
+  withBusy(e.target, async () => {
+    const out = $("#cert-out");
+    out.hidden = false;
+    out.textContent = "Generating…";
+    const gen = await api("/api/run", { script: "certs" });
+    let text = (gen.output || gen.error || "").trim();
+    if (!gen.ok) {
+      out.textContent = text || "(no output)";
+      return toast("Could not generate the certificates.", "err");
+    }
+    const inst = await api("/api/run", { script: "install-ca" });
+    text += "\n\n" + (inst.output || inst.error || "").trim();
+    if (!inst.ok) {
+      out.textContent = text;
+      return toast("Certificates generated, but the CA was not trusted.", "err");
+    }
+    if (state && state.proxy.running) {
+      if (state.proxy.managed) {
+        const r = await api("/api/proxy/restart", {});
+        text += "\n\n" + (r.ok ? "Proxy restarted with the new certificate." : "Proxy restart failed: " + (r.error || "unknown"));
+        if (r.ok) markRestart(false);
+      } else {
+        text += "\n\nThe proxy was not started by this panel: restart it yourself, it still holds the old certificate.";
+      }
+    }
+    out.textContent = text;
+    toast("Certificates reissued. Restart Claude Desktop.", "ok");
+  });
+});
 $("#btn-test").addEventListener("click", (e) => runScript(e.target, "test", "#test-out", "Test finished."));
 
 $("#btn-write-desktop").addEventListener("click", (e) => {

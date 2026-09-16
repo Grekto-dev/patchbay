@@ -231,6 +231,7 @@
         </div>
 
         <p class="hint filter-count" id="filter-count"></p>
+        <p class="hint filter-count" id="selected-total"></p>
       </div>
 
       <p class="hint" id="pricing-note" style="margin:12px 0 0"></p>
@@ -281,9 +282,18 @@
       </div>
       <div class="rows" id="cert-rows"></div>
       <div class="actions" style="margin-top:14px">
-        <button id="btn-gen-certs">Generate certificates</button>
-        <button id="btn-install-ca">Install CA in the system</button>
+        <button id="btn-install-ca" class="primary">Install CA</button>
+        <button id="btn-reissue">Reissue &amp; reinstall</button>
+        <span class="spacer"></span>
+        <button id="btn-remove-ca" class="danger">Remove CA</button>
       </div>
+      <p class="hint" style="margin:10px 0 0">
+        The CA goes into the current user's trust store — no administrator rights, and Windows asks you to
+        confirm, so the button waits for that dialog. <b>Reissue &amp; reinstall</b> generates a new CA and a
+        new server certificate, trusts the new CA and restarts the proxy; Claude Desktop has to be restarted
+        afterwards. <b>Remove CA</b> only untrusts it — the files under <code class="inline-code">certs/</code>
+        stay where they are.
+      </p>
       <pre class="out" id="cert-out" hidden></pre>
     </div>
 

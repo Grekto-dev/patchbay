@@ -203,7 +203,7 @@ function writeConfig(cfg) {
   if (Array.isArray(cfg.customProviders) && cfg.customProviders.length) {
     clean.customProviders = cfg.customProviders;
   }
-  for (const field of ["discovery", "catalogEnabled", "catalogIds", "catalogLabels"]) {
+  for (const field of ["discovery", "providersOff", "catalogEnabled", "catalogIds", "catalogLabels"]) {
     const value = cfg[field];
     if (value && typeof value === "object" && Object.keys(value).length) clean[field] = value;
   }
@@ -479,9 +479,16 @@ function assignIds(cards, costsFor, cfg) {
   const out = {};
   // Discovery-on providers first and in order: those are the ones the proxy
   // actually numbers. The rest are numbered afterwards, as a preview.
-  const ordered = [...cards].sort((a, b) => Number(Boolean(b.discovery)) - Number(Boolean(a.discovery)));
+  const live = (c) => Boolean(c.discovery) && c.on !== false;
+  const ordered = [...cards].sort((a, b) => Number(live(b)) - Number(live(a)));
 
   for (const card of ordered) {
+    if (card.on === false) {
+      // Switched off: the proxy serves nothing for it, so it gets no ids here
+      // either - otherwise they would be ids no request could ever reach.
+      out[card.key] = Object.fromEntries(card.models.map((m) => [m, ""]));
+      continue;
+    }
     const renamed = renamedAll[card.key] || {};
     const allow = Array.isArray(enabledAll[card.key]) ? new Set(enabledAll[card.key]) : null;
     const costs = costsFor(card.key);
@@ -922,25 +929,153 @@ function probeProxy(cb) {
 
 // ── Diagnostics ──────────────────────────────────────────
 
+function readCertFile(name) {
+  try {
+    const { X509Certificate } = require("crypto");
+    return new X509Certificate(fs.readFileSync(path.join(CERT_DIR, name)));
+  } catch {
+    return null; // missing, or a Node too old for X509Certificate
+  }
+}
+
+function thumbprintOf(cert) {
+  return String(cert.fingerprint || "").replace(/:/g, "").toUpperCase();
+}
+
+function daysUntil(when) {
+  return Math.round((new Date(when).getTime() - Date.now()) / 86400000);
+}
+
+// Where the CA has to be trusted for Claude Desktop to accept the gateway.
+const TRUST_STORE = IS_WIN
+  ? "CurrentUser\\Root"
+  : process.platform === "darwin"
+  ? "System keychain"
+  : "system CA bundle";
+
+// Asking the OS means spawning a shell, so the answer is cached and refreshed
+// in the background - never on the request path.
+const trust = { trusted: null, checkedAt: 0, thumbprint: null, error: null, pending: false };
+const TRUST_TTL_MS = 30000;
+
+function invalidateTrust() {
+  trust.checkedAt = 0;
+  refreshTrust(true);
+}
+
+function refreshTrust(force) {
+  if (trust.pending) return;
+  if (!force && trust.checkedAt && Date.now() - trust.checkedAt < TRUST_TTL_MS) return;
+
+  const ca = readCertFile("ca-cert.pem");
+  const want = ca ? thumbprintOf(ca) : "";
+  if (!/^[0-9A-F]{20,}$/.test(want)) {
+    trust.trusted = null;
+    trust.thumbprint = null;
+    trust.error = ca ? "unreadable CA fingerprint" : "no ca-cert.pem";
+    trust.checkedAt = Date.now();
+    return;
+  }
+
+  let cmd;
+  let args;
+  if (IS_WIN) {
+    cmd = "powershell";
+    args = [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      "@(Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { $_.Thumbprint -eq '" + want + "' }).Count",
+    ];
+  } else if (process.platform === "darwin") {
+    cmd = "sh";
+    args = ["-c", "security find-certificate -a -Z -c 'Claude-DS Proxy CA' 2>/dev/null | grep -c " + want];
+  } else {
+    cmd = "sh";
+    args = [
+      "-c",
+      "for f in /usr/local/share/ca-certificates/claude-proxy-ca.crt /etc/pki/ca-trust/source/anchors/claude-proxy-ca.pem; " +
+        'do [ -f "$f" ] && openssl x509 -noout -fingerprint -sha1 -in "$f"; done 2>/dev/null | tr -d ":" | grep -ci ' + want,
+    ];
+  }
+
+  trust.pending = true;
+  let proc;
+  try {
+    proc = spawn(cmd, args, { windowsHide: true });
+  } catch (e) {
+    trust.pending = false;
+    trust.trusted = null;
+    trust.error = e.message;
+    trust.checkedAt = Date.now();
+    return;
+  }
+  let out = "";
+  proc.stdout.on("data", (c) => (out += c));
+  proc.on("error", (e) => {
+    trust.pending = false;
+    trust.trusted = null;
+    trust.error = e.message;
+    trust.checkedAt = Date.now();
+  });
+  proc.on("close", () => {
+    const n = parseInt(String(out).trim().split(/\s+/).pop(), 10);
+    trust.pending = false;
+    trust.trusted = Number.isFinite(n) ? n > 0 : null;
+    trust.thumbprint = want;
+    trust.error = Number.isFinite(n) ? null : "could not read the trust store";
+    trust.checkedAt = Date.now();
+  });
+}
+
 function certInfo() {
   const files = ["ca-cert.pem", "ca-key.pem", "server-cert.pem", "server-key.pem"];
   const present = {};
   for (const f of files) present[f] = fs.existsSync(path.join(CERT_DIR, f));
-  let expires = null;
-  let subject = null;
-  let daysLeft = null;
-  if (present["server-cert.pem"]) {
+
+  const srv = present["server-cert.pem"] ? readCertFile("server-cert.pem") : null;
+  const ca = present["ca-cert.pem"] ? readCertFile("ca-cert.pem") : null;
+
+  // Claude Desktop validates the whole chain: a server cert the CA did not
+  // sign, or a CA without CA:TRUE, fails with ERR_CERT_AUTHORITY_INVALID even
+  // when both files are there and the CA is trusted.
+  let chainOk = null;
+  if (srv && ca) {
     try {
-      const { X509Certificate } = require("crypto");
-      const cert = new X509Certificate(fs.readFileSync(path.join(CERT_DIR, "server-cert.pem")));
-      expires = cert.validTo;
-      subject = cert.subject;
-      daysLeft = Math.round((new Date(cert.validTo).getTime() - Date.now()) / 86400000);
+      chainOk = srv.checkIssued(ca) && ca.ca === true;
     } catch {
-      /* unreadable cert */
+      chainOk = null;
     }
   }
-  return { present, ok: files.every((f) => present[f]), expires, subject, daysLeft };
+
+  refreshTrust(false);
+
+  return {
+    present,
+    ok: files.every((f) => present[f]),
+    expires: srv ? srv.validTo : null,
+    subject: srv ? srv.subject : null,
+    daysLeft: srv ? daysUntil(srv.validTo) : null,
+    chainOk,
+    ca: ca
+      ? {
+          subject: ca.subject,
+          thumbprint: thumbprintOf(ca),
+          expires: ca.validTo,
+          daysLeft: daysUntil(ca.validTo),
+          isCa: ca.ca === true,
+        }
+      : null,
+    trust: {
+      store: TRUST_STORE,
+      trusted: trust.trusted,
+      checkedAt: trust.checkedAt || null,
+      error: trust.error,
+      // A stale answer is about a CA that is no longer the one on disk.
+      stale: Boolean(ca && trust.thumbprint && trust.thumbprint !== thumbprintOf(ca)),
+    },
+  };
 }
 
 function desktopConfigPaths() {
@@ -1065,6 +1200,14 @@ function runScript(kind, cb) {
       cmd = "bash";
       args = [path.join(CERT_DIR, "install-ca.sh")];
     }
+  } else if (kind === "uninstall-ca") {
+    if (IS_WIN) {
+      cmd = "powershell";
+      args = ["-ExecutionPolicy", "Bypass", "-File", path.join(CERT_DIR, "uninstall-ca.ps1")];
+    } else {
+      cmd = "bash";
+      args = [path.join(CERT_DIR, "uninstall-ca.sh")];
+    }
   } else if (kind === "test") {
     cmd = process.execPath;
     args = [TEST_ENTRY];
@@ -1110,7 +1253,11 @@ function buildState(cb) {
   }));
 
   // A local endpoint needs no key, so having one is not what makes it usable.
-  const configured = all.filter((p) => p.custom || !isPlaceholder(env[p.env])).map((p) => p.key);
+  // A provider switched off in the panel is not usable either, whatever it has.
+  const off = cfg.providersOff && typeof cfg.providersOff === "object" ? cfg.providersOff : {};
+  const configured = all
+    .filter((p) => (p.custom || !isPlaceholder(env[p.env])) && off[p.key] !== true)
+    .map((p) => p.key);
   const active = cfg.provider && configured.includes(cfg.provider) ? cfg.provider : configured[0] || null;
 
   const models = {};
@@ -1244,6 +1391,7 @@ const server = http.createServer((req, res) => {
     return fetchPricing((pricing) =>
       fetchAllCatalogs(force, () => {
       const discovery = cfg.discovery && typeof cfg.discovery === "object" ? cfg.discovery : {};
+      const off = cfg.providersOff && typeof cfg.providersOff === "object" ? cfg.providersOff : {};
       const enabled = cfg.catalogEnabled && typeof cfg.catalogEnabled === "object" ? cfg.catalogEnabled : {};
       const ids = cfg.catalogIds && typeof cfg.catalogIds === "object" ? cfg.catalogIds : {};
       const env = readEnvFile();
@@ -1264,6 +1412,7 @@ const server = http.createServer((req, res) => {
           custom: Boolean(p.custom),
           baseUrl: p.baseUrl || null,
           hasKey: p.custom ? true : !isPlaceholder(env[p.env]),
+          on: off[p.key] !== true,
           discovery: discovery[p.key] === true,
           models: state.models,
           enabled: Array.isArray(enabled[p.key]) ? enabled[p.key] : null,
@@ -1302,6 +1451,15 @@ const server = http.createServer((req, res) => {
         cfg.discovery = { ...(cfg.discovery || {}) };
         if (body.discovery === true) cfg.discovery[provider] = true;
         else delete cfg.discovery[provider];
+      }
+
+      // Switching the provider off leaves every other setting of its own
+      // untouched, so turning it back on restores the selection as it was.
+      if ("on" in body) {
+        cfg.providersOff = { ...(cfg.providersOff || {}) };
+        if (body.on === false) cfg.providersOff[provider] = true;
+        else delete cfg.providersOff[provider];
+        if (!Object.keys(cfg.providersOff).length) delete cfg.providersOff;
       }
 
       if ("enabled" in body) {
@@ -1504,7 +1662,7 @@ const server = http.createServer((req, res) => {
       cfg.customProviders = next;
       // Anything pinned to or configured for it would dangle otherwise.
       if (cfg.provider === key) delete cfg.provider;
-      for (const field of ["discovery", "catalogEnabled", "catalogIds", "catalogLabels"]) {
+      for (const field of ["discovery", "providersOff", "catalogEnabled", "catalogIds", "catalogLabels"]) {
         if (cfg[field] && typeof cfg[field] === "object") delete cfg[field][key];
       }
 
@@ -1525,6 +1683,7 @@ const server = http.createServer((req, res) => {
       if (!body || !body.script) return sendJSON(res, 400, { error: "missing script" });
       runScript(body.script, (r) => {
         pushLog("[panel] " + body.script + ": " + (r.ok ? "ok" : "failed"), r.ok ? "info" : "error");
+        if (/^(certs|install-ca|uninstall-ca)$/.test(body.script)) invalidateTrust();
         sendJSON(res, 200, r);
       });
     });

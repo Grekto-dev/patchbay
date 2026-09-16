@@ -29,6 +29,16 @@ function loadOverrides() {
 }
 const OVERRIDES = loadOverrides();
 
+// The panel can switch a whole provider off:
+//   { "providersOff": { "deepseek": true } }
+// An off provider is not routed to, is not discovered and publishes no ids -
+// the same as if its key had never been set.
+const PROVIDER_OFF = OVERRIDES.providersOff && typeof OVERRIDES.providersOff === "object" ? OVERRIDES.providersOff : {};
+
+function providerOn(key) {
+  return PROVIDER_OFF[key] !== true;
+}
+
 // ── Proxy Port ───────────────────────────────────────────
 const PROXY_PORT = Number(OVERRIDES.port) > 0 ? Number(OVERRIDES.port) : 8877;
 
@@ -128,7 +138,7 @@ const CANONICAL_IDS = new Set(
 // is not the same as "has an API key".
 function providerReady(key) {
   const ep = ENDPOINTS[key];
-  return Boolean(ep && (ep.apiKey || ep.custom));
+  return Boolean(ep && providerOn(key) && (ep.apiKey || ep.custom));
 }
 
 // Model-map overrides from proxy-config.json:
@@ -268,7 +278,7 @@ const CATALOG_ENABLED = OVERRIDES.catalogEnabled && typeof OVERRIDES.catalogEnab
 const CATALOG_IDS = OVERRIDES.catalogIds && typeof OVERRIDES.catalogIds === "object" ? OVERRIDES.catalogIds : {};
 
 function discoveryOn(provider) {
-  return DISCOVERY[provider] === true;
+  return providerOn(provider) && DISCOVERY[provider] === true;
 }
 
 function anyDiscoveryOn() {
@@ -672,7 +682,7 @@ function resolveEndpoint(parsed) {
   // Check if any message contains images → route to Gemini
   const messages = parsed.messages || [];
   for (const msg of messages) {
-    if (Array.isArray(msg.content) && msg.content.some((c) => c.type === "image")) {
+    if (Array.isArray(msg.content) && msg.content.some((c) => c.type === "image") && providerOn("gemini")) {
       const ep = ENDPOINTS.gemini;
       // When Gemini is already the text backend there is nothing to hand off
       // to: send the images to it directly instead of OCR-ing them first.
@@ -1537,7 +1547,8 @@ function handleRequest(req, res) {
     // Root status endpoint
     const models = {};
     for (const [key, ep] of Object.entries(ENDPOINTS)) {
-      if (ep.modelMap) {
+      // A switched-off provider answers nothing, so its ids are not a route.
+      if (ep.modelMap && providerOn(key)) {
         for (const [cModel, uModel] of Object.entries(ep.modelMap)) {
           models[cModel] = `${key}:${uModel}`;
         }
@@ -1553,6 +1564,7 @@ function handleRequest(req, res) {
         Object.keys(CATALOG_SOURCES).map((k) => [
           k,
           {
+            on: providerOn(k),
             discovery: discoveryOn(k),
             count: CATALOGS[k].models.length,
             fetchedAt: CATALOGS[k].fetchedAt || null,
@@ -1749,6 +1761,8 @@ server.listen(PROXY_PORT, "127.0.0.1", () => {
     const keyNote = activeEp.apiKey || activeEp.custom ? "" : "  ⚠ no API key configured!";
     console.log(`  Text backend: ${activeEp.label}${keyNote}`);
     console.log(`  Gemini Flash: auto image/OCR routing`);
+    const off = Object.keys(ENDPOINTS).filter((k) => !providerOn(k));
+    if (off.length) console.log(`  Switched off: ${off.map((k) => ENDPOINTS[k].label).join(", ")}`);
     const discovering = Object.keys(CATALOG_SOURCES).filter(discoveryOn);
     if (discovering.length) {
       console.log(`  Dynamic discovery: ${discovering.map((k) => ENDPOINTS[k].label).join(", ")}`);

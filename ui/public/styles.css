@@ -258,6 +258,10 @@ select { font-family: inherit; cursor: pointer; }
 .switch input:disabled { opacity: .4; cursor: not-allowed; }
 
 td.tight, th.tight { width: 44px; }
+.tag.count { font-variant-numeric: tabular-nums; }
+.tag.count.zero { opacity: .55; }
+.tag.off { background: var(--bg-elev-2); color: var(--text-faint); border-color: var(--border); }
+.card.off .card-head > div:first-child { opacity: .6; }
 .selall { cursor: pointer; }
 .selall:disabled { opacity: .4; cursor: not-allowed; }
 tr.off td:not(.tight) { opacity: .45; }
