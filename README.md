@@ -466,10 +466,27 @@ Delete it to return to the built-in defaults. Nothing here rewrites
 ## Running and stopping
 
 ```cmd
-panel.bat                 :: control panel (recommended — it can start the proxy)
+patchbay.bat              :: everything: panel, proxy and dashboard (recommended)
+panel.bat                 :: control panel only — it can start the proxy itself
 start.bat                 :: proxy only
 node proxy/server.js      :: proxy only, any platform
 ```
+
+`patchbay.bat` is the one-click entry point: it brings the panel up (minimised),
+asks it to start the proxy — so the proxy is a child of the panel and its output
+lands in the **Live logs** tab — waits for both to answer, then opens the
+dashboard. Running it again when everything is up costs half a second and just
+reopens the dashboard; nothing is ever started twice. Make a desktop shortcut to
+it, or call it from a launcher of your own:
+
+```cmd
+@echo off
+call "C:\path\to\patchbay\patchbay.bat"
+start claude:
+```
+
+Closing the minimised **Patchbay - control panel** window stops the panel, and
+with it the proxy it started.
 
 ```cmd
 taskkill /f /im node.exe           :: Windows
@@ -492,6 +509,7 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 .
 ├── panel.bat / panel.sh     Control panel launchers
 ├── start.bat / start.sh     Proxy launchers
+├── patchbay.bat             One click: panel + proxy + dashboard
 ├── setup.bat / setup.sh     Interactive first-time setup
 ├── .env                     API keys (gitignored)
 ├── proxy-config.json        Panel-written overrides (gitignored)
