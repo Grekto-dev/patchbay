@@ -27,6 +27,7 @@ const CONFIG_PATH = path.join(ROOT, "proxy-config.json");
 const PROXY_ENTRY = path.join(ROOT, "proxy", "server.js");
 const TEST_ENTRY = path.join(ROOT, "proxy", "test-proxy.js");
 const CERT_DIR = path.join(ROOT, "certs");
+const antigravity = require(path.join(ROOT, "proxy", "antigravity.js"));
 const IS_WIN = process.platform === "win32";
 
 const UI_PORT = Number(process.env.UI_PORT) > 0 ? Number(process.env.UI_PORT) : 8878;
@@ -40,11 +41,20 @@ const BUILTIN_PROVIDERS = [
   { key: "glm", label: "GLM (Z.ai)", env: "GLM_API_KEY", url: "https://z.ai" },
   { key: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY", url: "https://platform.deepseek.com" },
   {
+    key: "antigravity",
+    label: "Google Antigravity",
+    env: null,
+    oauth: true,
+    url: "https://antigravity.google",
+    note: "signed in with a Google account instead of a key \u00b7 Gemini and the Claude models Google hosts",
+  },
+  {
     key: "gemini",
-    label: "Google AI Studio",
+    label: "Google AI Studio (images)",
     env: "GEMINI_API_KEY",
     url: "https://aistudio.google.com/apikey",
-    note: "also the image / OCR backend, whichever provider handles text",
+    imagesOnly: true,
+    note: "images and OCR only \u00b7 the text goes to whichever provider is serving",
   },
 ];
 
@@ -111,6 +121,10 @@ let childStartedAt = 0;
 let logs = [];
 let logSeq = 0;
 const sseClients = new Set();
+
+// The Google sign-in in flight, if any: the browser goes off to Google and
+// comes back to a callback server the module owns, which can take minutes.
+let googleFlow = null;
 let stats = emptyStats();
 
 function emptyStats() {
@@ -203,9 +217,14 @@ function writeConfig(cfg) {
   if (Array.isArray(cfg.customProviders) && cfg.customProviders.length) {
     clean.customProviders = cfg.customProviders;
   }
+  // Settings left behind by a provider that no longer serves text - the AI
+  // Studio key, since it became the image path - would sit in the file forever.
+  const deadKeys = BUILTIN_PROVIDERS.filter((p) => p.imagesOnly).map((p) => p.key);
   for (const field of ["discovery", "providersOff", "catalogEnabled", "catalogIds", "catalogLabels"]) {
     const value = cfg[field];
-    if (value && typeof value === "object" && Object.keys(value).length) clean[field] = value;
+    if (!value || typeof value !== "object") continue;
+    const kept = Object.fromEntries(Object.entries(value).filter(([k]) => !deadKeys.includes(k)));
+    if (Object.keys(kept).length) clean[field] = kept;
   }
   if (cfg.models && typeof cfg.models === "object") {
     const models = {};
@@ -242,7 +261,13 @@ function defaultModelMaps() {
     return FALLBACK_MAPS;
   }
   const out = {};
-  for (const { key } of BUILTIN_PROVIDERS) {
+  for (const { key, imagesOnly } of BUILTIN_PROVIDERS) {
+    // AI Studio publishes nothing to Claude Desktop any more - it only reads
+    // images - so it reserves no ids either.
+    if (imagesOnly) {
+      out[key] = {};
+      continue;
+    }
     const start = src.indexOf("\n  " + key + ": {");
     if (start < 0) {
       out[key] = FALLBACK_MAPS[key];
@@ -285,16 +310,9 @@ const CATALOG_SOURCES = {
   // OpenRouter reports pricing and modalities itself, so its catalog needs no
   // help from models.dev.
   openrouter: { sources: [{ host: "openrouter.ai", path: "/api/v1/models", parse: "openrouter" }] },
-  gemini: {
-    sources: [
-      {
-        host: "generativelanguage.googleapis.com",
-        path: "/v1beta/models?pageSize=200",
-        auth: "query",
-        parse: "google",
-      },
-    ],
-  },
+  // Not an HTTP source: the account, its OAuth token and its project all come
+  // from proxy/antigravity.js, which fetchCatalog calls directly.
+  antigravity: { oauth: true, sources: [] },
   // Coding Plan keys and general keys live on different bases; try both.
   glm: {
     sources: [
@@ -438,6 +456,19 @@ const FAMILY_START = 3;
 const HAIKU_MAX_INPUT = 0.3; // $/M tokens
 const SONNET_MAX_INPUT = 2;
 
+// Mirrors familyByName in proxy/server.js. Antigravity models carry no price,
+// so the name is all there is to place them by - and both sides must agree.
+function familyByName(model) {
+  const m = String(model).toLowerCase();
+  if (m.includes("opus")) return "opus";
+  if (m.includes("sonnet")) return "sonnet";
+  if (m.includes("haiku")) return "haiku";
+  if (m.includes("lite")) return "haiku";
+  if (m.includes("pro")) return "opus";
+  if (m.includes("flash")) return "sonnet";
+  return "fable";
+}
+
 function familyForCost(cost) {
   if (!cost) return "fable";
   if (cost.free || cost.input <= HAIKU_MAX_INPUT) return "haiku";
@@ -504,7 +535,7 @@ function assignIds(cards, costsFor, cfg) {
       }
       let id = typeof renamed[model] === "string" && /^claude-/.test(renamed[model]) ? renamed[model] : null;
       if (!id) {
-        const family = familyForCost(costs[model]);
+        const family = card.oauth ? familyByName(model) : familyForCost(costs[model]);
         do {
           id = familyId(family, counters[family]++);
         } while (taken.has(id));
@@ -656,6 +687,26 @@ function fetchProviderList(provider, key, index, cb) {
 
 function fetchCatalog(provider, cb) {
   const state = catalogState(provider);
+  if (provider === "antigravity") {
+    if (!antigravity.hasAccounts()) {
+      state.error = "no Google account connected";
+      state.models = [];
+      return cb(state);
+    }
+    return antigravity.listModels((err, data) => {
+      if (err) {
+        state.error = err.message;
+      } else {
+        state.models = data.models;
+        state.info = data.info;
+        state.surfaces = {};
+        state.pricing = null;
+        state.fetchedAt = Date.now();
+        state.error = null;
+      }
+      cb(state);
+    });
+  }
   const key = envKeyFor(provider);
   const entry = providers().find((p) => p.key === provider);
   const keyless = Boolean(entry && entry.custom);
@@ -696,13 +747,15 @@ function fetchAllCatalogsNow(force, cb) {
   for (const provider of list) {
     const state = catalogState(provider);
     const entry = providers().find((p) => p.key === provider);
-    const hasKey = Boolean(entry && entry.custom) || !isPlaceholder(envKeyFor(provider));
+    const hasKey = entry && entry.oauth
+      ? antigravity.hasAccounts()
+      : Boolean(entry && entry.custom) || !isPlaceholder(envKeyFor(provider));
     const stale = Date.now() - state.fetchedAt > 5 * 60 * 1000;
     const shouldFetch = hasKey && (force || (!state.models.length && stale) || stale);
     if (!shouldFetch) {
       if (!hasKey) {
         state.models = [];
-        state.error = "no API key configured";
+        state.error = entry && entry.oauth ? "no Google account connected" : "no API key configured";
       }
       if (--pending === 0) cb();
       continue;
@@ -1242,21 +1295,24 @@ function buildState(cb) {
 
   const keys = all.map((f) => ({
     key: f.key,
-    env: f.env,
+    env: f.env || null,
     label: f.label,
     url: f.url,
     note: f.note || null,
     custom: Boolean(f.custom),
+    oauth: Boolean(f.oauth),
+    imagesOnly: Boolean(f.imagesOnly),
     baseUrl: f.baseUrl || null,
-    set: !isPlaceholder(env[f.env]),
-    masked: maskKey(env[f.env] || ""),
+    set: f.oauth ? antigravity.hasAccounts() : !isPlaceholder(env[f.env]),
+    masked: f.oauth ? "" : maskKey(env[f.env] || ""),
   }));
 
   // A local endpoint needs no key, so having one is not what makes it usable.
   // A provider switched off in the panel is not usable either, whatever it has.
   const off = cfg.providersOff && typeof cfg.providersOff === "object" ? cfg.providersOff : {};
   const configured = all
-    .filter((p) => (p.custom || !isPlaceholder(env[p.env])) && off[p.key] !== true)
+    .filter((p) => !p.imagesOnly && off[p.key] !== true)
+    .filter((p) => (p.oauth ? antigravity.hasAccounts() : p.custom || !isPlaceholder(env[p.env])))
     .map((p) => p.key);
   const active = cfg.provider && configured.includes(cfg.provider) ? cfg.provider : configured[0] || null;
 
@@ -1292,6 +1348,11 @@ function buildState(cb) {
       configuredProviders: configured,
       models,
       config: cfg,
+      google: {
+        accounts: antigravity.summary(),
+        file: antigravity.ACCOUNTS_PATH,
+        clientConfigured: antigravity.clientConfigured(),
+      },
       certs: certInfo(),
       desktop: desktopInfo(),
       stats,
@@ -1411,7 +1472,10 @@ const server = http.createServer((req, res) => {
           env: p.env,
           custom: Boolean(p.custom),
           baseUrl: p.baseUrl || null,
-          hasKey: p.custom ? true : !isPlaceholder(env[p.env]),
+          hasKey: p.oauth ? antigravity.hasAccounts() : p.custom ? true : !isPlaceholder(env[p.env]),
+          oauth: Boolean(p.oauth),
+          // Per-model quota, when the provider reports it (Antigravity does).
+          quota: state.info || null,
           on: off[p.key] !== true,
           discovery: discovery[p.key] === true,
           models: state.models,
@@ -1489,7 +1553,10 @@ const server = http.createServer((req, res) => {
         for (const [model, raw] of Object.entries(body.labels || {})) {
           if (typeof model !== "string" || typeof raw !== "string") continue;
           const label = raw.trim().slice(0, 80);
-          if (!label || label === model) continue; // same as the default → nothing to store
+          // Not compared against the model id any more: with providers that
+          // publish a display name, the default is that name, so a label equal
+          // to the id is a deliberate override.
+          if (!label) continue;
           labels[model] = label;
         }
         cfg.catalogLabels = { ...(cfg.catalogLabels || {}) };
@@ -1686,6 +1753,58 @@ const server = http.createServer((req, res) => {
         if (/^(certs|install-ca|uninstall-ca)$/.test(body.script)) invalidateTrust();
         sendJSON(res, 200, r);
       });
+    });
+  }
+
+  // ── Google account (Antigravity) ──
+  if (url === "/api/google/connect" && req.method === "POST") {
+    if (googleFlow && Date.now() - googleFlow.startedAt < 5 * 60 * 1000) {
+      return sendJSON(res, 200, { ok: true, url: googleFlow.url, pending: true });
+    }
+    let answered = false;
+    return antigravity.authorize(
+      (err, info) => {
+        if (answered) return;
+        answered = true;
+        if (err) return sendJSON(res, 500, { error: err.message });
+        googleFlow = { url: info.url, port: info.port, startedAt: Date.now(), result: null };
+        pushLog("[panel] Google sign-in started on port " + info.port, "info");
+        sendJSON(res, 200, { ok: true, url: info.url, port: info.port });
+      },
+      (err, account) => {
+        if (!googleFlow) googleFlow = { startedAt: Date.now() };
+        googleFlow.result = err ? { error: err.message } : { email: account.email, warning: account.warning || null };
+        googleFlow.finishedAt = Date.now();
+        pushLog(
+          err ? "[panel] Google sign-in failed: " + err.message : "[panel] Google account connected: " + account.email,
+          err ? "error" : "info"
+        );
+        // The model list is per account, so what is cached no longer applies.
+        delete catalogCache.antigravity;
+        if (!answered) {
+          answered = true;
+          if (err) sendJSON(res, 500, { error: err.message });
+          else sendJSON(res, 200, { ok: true, account: account.email });
+        }
+      }
+    );
+  }
+
+  if (url === "/api/google/status") {
+    const flow = googleFlow
+      ? { url: googleFlow.url || null, startedAt: googleFlow.startedAt, result: googleFlow.result || null }
+      : null;
+    return sendJSON(res, 200, { accounts: antigravity.summary(), flow });
+  }
+
+  if (url === "/api/google/remove" && req.method === "POST") {
+    return readBody(req, (body) => {
+      if (!body || !body.email) return sendJSON(res, 400, { error: "missing email" });
+      const removed = antigravity.removeAccount(String(body.email));
+      if (!removed) return sendJSON(res, 404, { error: "not found" });
+      delete catalogCache.antigravity;
+      pushLog("[panel] Google account removed: " + body.email, "info");
+      return sendJSON(res, 200, { ok: true, accounts: antigravity.summary(), needsRestart: true });
     });
   }
 

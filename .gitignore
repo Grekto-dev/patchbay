@@ -36,5 +36,8 @@ logs/
 # Overrides locais escritos pelo painel (ui/)
 proxy-config.json
 
+# Google OAuth accounts (refresh tokens — never commit)
+google-accounts.json
+
 # Certificate backups (private keys — never commit)
 *.pem.*

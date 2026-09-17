@@ -27,6 +27,8 @@ function loadOverrides() {
     return {};
   }
 }
+const antigravity = require("./antigravity.js");
+
 const OVERRIDES = loadOverrides();
 
 // The panel can switch a whole provider off:
@@ -58,26 +60,35 @@ const ENDPOINTS = {
     defaultModel: "deepseek-v4-flash",
     type: "anthropic",
   },
+  // The AI Studio key is the image path only: it reads the pictures Claude
+  // Desktop sends and hands the text to whichever provider is serving. Google
+  // as a *text* backend is the antigravity endpoint below, which needs no key.
   gemini: {
-    label: "Google AI Studio",
+    label: "Google AI Studio (images)",
     host: "generativelanguage.googleapis.com",
     basePath: "/v1beta/models",
     apiKey: process.env.GEMINI_API_KEY || null,
-    // Used by the image pipeline when another provider handles the text.
-    // (gemini-2.5-flash now 404s for new keys; Google points at 3.6.)
+    // gemini-2.5-flash now 404s for new keys; Google points at 3.6.
     model: "gemini-3.6-flash",
-    // Concrete ids, not the "-latest" aliases: those currently resolve to
-    // thinking models that spend the whole budget before answering. Pro
-    // models are omitted because they are 429 on the free AI Studio tier -
-    // discovery adds every id, so pick one there if your key has the quota.
-    modelMap: {
-      "claude-sonnet-4-5": "gemini-3.6-flash",
-      "claude-sonnet-4-6": "gemini-3.6-flash",
-      "claude-opus-4-7": "gemini-3.8-flash",
-      "claude-haiku-4-5-20251001": "gemini-3.1-flash-lite",
-    },
-    defaultModel: "gemini-3.6-flash",
     type: "gemini",
+    imagesOnly: true,
+  },
+  // Google's Cloud Code surface, authenticated with a Google account instead
+  // of an API key. Serves the Gemini line and the Claude models Google hosts;
+  // quota is per account, so proxy/antigravity.js keeps a list and rotates.
+  antigravity: {
+    label: "Google Antigravity",
+    oauth: true,
+    // What a free-tier account is served today. Which ids exist depends on the
+    // account's tier, so this is only the discovery-off fallback.
+    modelMap: {
+      "claude-sonnet-4-5": "gemini-3.6-flash-medium",
+      "claude-sonnet-4-6": "gemini-3.6-flash-medium",
+      "claude-opus-4-7": "gemini-3.6-flash-high",
+      "claude-haiku-4-5-20251001": "gemini-3.5-flash-lite",
+    },
+    defaultModel: "gemini-3.6-flash-medium",
+    type: "antigravity",
   },
   opencode: {
     label: "OpenCode Go",
@@ -138,7 +149,11 @@ const CANONICAL_IDS = new Set(
 // is not the same as "has an API key".
 function providerReady(key) {
   const ep = ENDPOINTS[key];
-  return Boolean(ep && providerOn(key) && (ep.apiKey || ep.custom));
+  if (!ep || !providerOn(key)) return false;
+  // Three ways to be usable: a key, a local endpoint that needs none, or a
+  // connected Google account.
+  if (ep.oauth) return antigravity.hasAccounts();
+  return Boolean(ep.apiKey || ep.custom);
 }
 
 // Model-map overrides from proxy-config.json:
@@ -160,7 +175,7 @@ if (OVERRIDES.models && typeof OVERRIDES.models === "object") {
 // OpenAI-format conversion (type: "opencode").
 // Gemini sits last: its key is usually present for images alone, so it should
 // only take over the text when nothing else is configured - or when pinned.
-let TEXT_PROVIDER_PRIORITY = ["opencode", "openrouter", "glm", "deepseek", "gemini"];
+let TEXT_PROVIDER_PRIORITY = ["opencode", "openrouter", "glm", "deepseek", "antigravity"];
 
 
 // ── Live provider catalogs ───────────────────────────
@@ -186,16 +201,9 @@ const CATALOG_SOURCES = {
   // OpenRouter reports pricing and modalities itself, so the catalog is
   // filtered to text-output models without asking models.dev.
   openrouter: { sources: [{ host: "openrouter.ai", path: "/api/v1/models", parse: "openrouter" }] },
-  gemini: {
-    sources: [
-      {
-        host: "generativelanguage.googleapis.com",
-        path: "/v1beta/models?pageSize=200",
-        auth: "query",
-        parse: "google",
-      },
-    ],
-  },
+  // Not a plain GET: the account list, the OAuth token and the project all
+  // come from proxy/antigravity.js, so refreshCatalog calls it directly.
+  antigravity: { oauth: true, sources: [] },
   // Coding Plan keys and general keys live on different bases; try both.
   glm: {
     sources: [
@@ -292,7 +300,6 @@ const PRICING_SOURCES = {
   opencode: ["opencode-go", "opencode"],
   deepseek: ["deepseek"],
   glm: ["zai-coding-plan", "zai", "zhipuai-coding-plan", "zhipuai"],
-  gemini: ["google"],
 };
 const FREE_TTL_MS = 12 * 60 * 60 * 1000;
 // { provider: { model: { free, input, output } } } - drives both the free-only
@@ -380,7 +387,23 @@ const FAMILY_START = 3;
 const HAIKU_MAX_INPUT = 0.3; // $/M tokens
 const SONNET_MAX_INPUT = 2;
 
+// Antigravity models carry no price at all, so cost cannot place them. The
+// name can: pro is the big one, lite the small one, flash in between. Mirrored
+// in ui/server.js - both sides must agree or the ids diverge.
+function familyByName(model) {
+  const m = String(model).toLowerCase();
+  if (m.includes("opus")) return "opus";
+  if (m.includes("sonnet")) return "sonnet";
+  if (m.includes("haiku")) return "haiku";
+  if (m.includes("lite")) return "haiku";
+  if (m.includes("pro")) return "opus";
+  if (m.includes("flash")) return "sonnet";
+  return "fable";
+}
+
 function familyFor(provider, model) {
+  const ep = ENDPOINTS[provider];
+  if (ep && ep.oauth) return familyByName(model);
   const cost = costOf(provider, model);
   if (!cost) return "fable";
   if (cost.free || cost.input <= HAIKU_MAX_INPUT) return "haiku";
@@ -433,7 +456,7 @@ const generatedIds = {}; // provider → { claudeId: upstreamModel }
 // TEXT_PROVIDER_PRIORITY, which gets reordered when a provider is pinned, and
 // mirrors the panel's provider list so both sides generate the same ids.
 function idOrder() {
-  const builtins = ["opencode", "openrouter", "glm", "deepseek", "gemini"];
+  const builtins = ["opencode", "openrouter", "glm", "deepseek", "antigravity"];
   return [
     ...builtins.filter((k) => ENDPOINTS[k]),
     ...Object.keys(ENDPOINTS).filter((k) => ENDPOINTS[k].custom),
@@ -620,6 +643,26 @@ function refreshCatalog(provider, cb) {
   const state = CATALOGS[provider];
   const ep = ENDPOINTS[provider];
   if (!state || !ep) return done(null);
+  if (ep.oauth) {
+    if (!antigravity.hasAccounts()) {
+      state.error = "no Google account connected";
+      return done(state);
+    }
+    return antigravity.listModels((err, data) => {
+      if (err) {
+        state.error = err.message;
+        console.error(`[proxy] [CATALOG] ${ep.label}: failed — ${err.message}`);
+        return done(state);
+      }
+      state.models = data.models;
+      state.info = data.info;
+      state.fetchedAt = Date.now();
+      state.error = null;
+      const added = applyCatalog(provider, data.models, {});
+      console.log(`[proxy] [CATALOG] ${ep.label}: ${data.models.length} models (${added} ids published)`);
+      done(state);
+    });
+  }
   if (!ep.apiKey && !ep.custom) {
     state.error = "no API key";
     return done(state);
@@ -649,10 +692,10 @@ function refreshCatalogs() {
     if (!discoveryOn(provider)) continue;
     const ep = ENDPOINTS[provider];
     if (!ep) continue;
-    if (!ep.apiKey && !ep.custom) {
+    if (!providerReady(provider)) {
       // Discovery is on but there is nothing to authenticate with; say so
       // instead of reporting an empty catalog with no reason.
-      CATALOGS[provider].error = "no API key";
+      CATALOGS[provider].error = ep.oauth ? "no Google account connected" : "no API key";
       continue;
     }
     refreshCatalog(provider);
@@ -682,16 +725,21 @@ function resolveEndpoint(parsed) {
   // Check if any message contains images → route to Gemini
   const messages = parsed.messages || [];
   for (const msg of messages) {
-    if (Array.isArray(msg.content) && msg.content.some((c) => c.type === "image") && providerOn("gemini")) {
-      const ep = ENDPOINTS.gemini;
-      // When Gemini is already the text backend there is nothing to hand off
-      // to: send the images to it directly instead of OCR-ing them first.
-      if (getPrimaryTextEndpoint() === "gemini") {
-        console.log(`[proxy] [IMAGE] image detected → Gemini handles it directly`);
-        return { key: "gemini", ep, upstreamModel: ep.modelMap[origModel] || ep.defaultModel, directGemini: true };
+    if (Array.isArray(msg.content) && msg.content.some((c) => c.type === "image")) {
+      // The AI Studio key is what images are for: it reads them and the text
+      // backend answers. Without that key a connected Google account can do
+      // both, since these models are multimodal too.
+      if (ENDPOINTS.gemini.apiKey && providerOn("gemini")) {
+        console.log(`[proxy] [IMAGE] image detected → routing to Google AI Studio`);
+        return { key: "gemini", ep: ENDPOINTS.gemini, upstreamModel: ENDPOINTS.gemini.model, isImagePipeline: true };
       }
-      console.log(`[proxy] [IMAGE] image detected → routing to Gemini`);
-      return { key: "gemini", ep, upstreamModel: ep.model, isImagePipeline: true };
+      if (providerReady("antigravity")) {
+        const ep = ENDPOINTS.antigravity;
+        const model = ep.modelMap[origModel] || ep.defaultModel;
+        console.log(`[proxy] [IMAGE] no AI Studio key — Google Antigravity handles the image directly`);
+        return { key: "antigravity", ep, upstreamModel: model };
+      }
+      console.log(`[proxy] [IMAGE] image detected, but no Google credentials — passing it to the text backend`);
     }
   }
 
@@ -1285,6 +1333,69 @@ function sendOpenCodeRequest(ep, parsed, req, res, origModel) {
   upstream.end();
 }
 
+// Google's SSE, whichever door it came through, turned into Anthropic's.
+// `prepare` unwraps one payload into a plain Gemini chunk - the Cloud Code
+// surface nests it under `response` and mixes reasoning into the parts.
+function pumpGeminiStream(upstreamRes, res, origModel, tag, prepare) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  const state = { started: false, blockStarted: false, finished: false };
+  const emit = (events) => {
+    for (const ev of [].concat(events || [])) {
+      if (!ev) continue;
+      if (ev.type === "message_stop") state.finished = true;
+      res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+    }
+  };
+
+  const feed = (payload) => {
+    if (!payload || payload === "[DONE]") return;
+    try {
+      const chunk = prepare(JSON.parse(payload));
+      if (!chunk) return;
+      // The first chunk only opens the message, so run it until it stops
+      // producing events for this payload.
+      let guard = 0;
+      let events = geminiToAnthropicSSE(chunk, origModel, state);
+      while (events && guard++ < 4) {
+        emit(events);
+        const next = geminiToAnthropicSSE(chunk, origModel, state);
+        if (!next || JSON.stringify(next) === JSON.stringify(events)) break;
+        events = next;
+      }
+    } catch {
+      /* ignore non-json lines */
+    }
+  };
+
+  let buffer = "";
+  upstreamRes.on("data", (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (line.startsWith("data: ")) feed(line.slice(6).trim());
+    }
+  });
+
+  upstreamRes.on("end", () => {
+    if (buffer.startsWith("data: ")) feed(buffer.slice(6).trim());
+    if (state.started && !state.finished) {
+      if (state.blockStarted) emit({ type: "content_block_stop", index: 0 });
+      emit([
+        { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } },
+        { type: "message_stop" },
+      ]);
+    }
+    res.end();
+    console.log(`[proxy] [${tag}] ← stream complete`);
+  });
+}
+
 // ── Gemini as a text backend ─────────────────────────────
 // Google AI Studio speaks its own format, so the request is converted on the
 // way out and the response (or SSE stream) on the way back. The same call
@@ -1346,62 +1457,7 @@ function sendGeminiRequest(ep, parsed, req, res, origModel, upstreamModel, retry
         return;
       }
 
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      });
-
-      const state = { started: false, blockStarted: false, finished: false };
-      const emit = (events) => {
-        for (const ev of [].concat(events || [])) {
-          if (!ev) continue;
-          if (ev.type === "message_stop") state.finished = true;
-          res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
-        }
-      };
-
-      const feed = (payload) => {
-        if (!payload || payload === "[DONE]") return;
-        try {
-          const chunk = JSON.parse(payload);
-          // The first chunk only opens the message, so run it until it stops
-          // producing events for this payload.
-          let guard = 0;
-          let events = geminiToAnthropicSSE(chunk, origModel, state);
-          while (events && guard++ < 4) {
-            emit(events);
-            const next = geminiToAnthropicSSE(chunk, origModel, state);
-            if (!next || JSON.stringify(next) === JSON.stringify(events)) break;
-            events = next;
-          }
-        } catch {
-          /* ignore non-json lines */
-        }
-      };
-
-      let buffer = "";
-      upstreamRes.on("data", (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) {
-          if (line.startsWith("data: ")) feed(line.slice(6).trim());
-        }
-      });
-
-      upstreamRes.on("end", () => {
-        if (buffer.startsWith("data: ")) feed(buffer.slice(6).trim());
-        if (state.started && !state.finished) {
-          if (state.blockStarted) emit({ type: "content_block_stop", index: 0 });
-          emit([
-            { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } },
-            { type: "message_stop" },
-          ]);
-        }
-        res.end();
-        console.log(`[proxy] [GEMINI] ← stream complete`);
-      });
+      pumpGeminiStream(upstreamRes, res, origModel, "GEMINI", (chunk) => chunk);
     }
   );
 
@@ -1413,6 +1469,92 @@ function sendGeminiRequest(ep, parsed, req, res, origModel, upstreamModel, retry
 
   upstream.write(geminiBodyStr);
   upstream.end();
+}
+
+
+// ── Google Antigravity as a text backend ─────────────────
+// Same Gemini request shape as AI Studio, wrapped for Cloud Code and signed
+// with a Google account. proxy/antigravity.js owns the accounts, the tokens
+// and the rotation; everything here is format.
+function sendAntigravityRequest(ep, parsed, req, res, origModel, upstreamModel) {
+  const targetModel = upstreamModel || ep.defaultModel;
+  const isStream = !!parsed.stream;
+
+  if (!parsed.max_tokens || parsed.max_tokens < 1024) parsed.max_tokens = 8192;
+
+  const googleBody = anthropicToGeminiContents(parsed, origModel);
+  // Reasoning is charged to the same budget as the answer, and every Gemini 3
+  // model reasons. Too low a ceiling and the reply comes back empty with
+  // MAX_TOKENS - all of it spent thinking. 16k is what the Antigravity client
+  // itself asks for; the model still stops as soon as it is done.
+  googleBody.generationConfig = {
+    ...(googleBody.generationConfig || {}),
+    maxOutputTokens: Math.max(Number(parsed.max_tokens) || 0, 16384),
+  };
+  console.log(`[proxy] [ANTIGRAVITY] model: ${targetModel} (from ${origModel}, stream=${isStream})`);
+
+  // Reasoning is not the answer: Gemini 3 streams its thinking as parts of the
+  // same candidate, and Claude Desktop would print it as the reply.
+  const unwrap = (payload) => {
+    const inner = (payload && payload.response) || payload;
+    const candidate = (inner && inner.candidates && inner.candidates[0]) || null;
+    if (candidate && candidate.content && Array.isArray(candidate.content.parts)) {
+      candidate.content.parts = candidate.content.parts.filter((p) => p.thought !== true);
+    }
+    return inner;
+  };
+
+  const fail = (message, code) => {
+    console.error(`[proxy] [ANTIGRAVITY] ⚠ ${message}`);
+    if (!res.headersSent) res.writeHead(code || 502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ type: "error", error: { message: "Google Antigravity: " + message } }));
+  };
+
+  antigravity.call({ model: targetModel, request: googleBody, stream: isStream }, (err, upstreamRes, ctx) => {
+    if (err) return fail(err.message, /rate-limited|quota/i.test(err.message) ? 429 : 502);
+
+    console.log(`[proxy] [ANTIGRAVITY] → ${ctx.host} as ${ctx.account}${ctx.sse ? " (sse)" : ""}`);
+
+    if (isStream) {
+      pumpGeminiStream(upstreamRes, res, origModel, "ANTIGRAVITY", unwrap);
+      return;
+    }
+
+    // A thinking model only answers over SSE, so a plain request is served by
+    // merging that stream back into one response.
+    if (ctx.sse) {
+      antigravity.collectSse(upstreamRes, (err2, merged) => {
+        if (err2) return fail(err2.message);
+        console.log(`[proxy] [ANTIGRAVITY] ← merged stream (${merged.thinkingLength} thinking chars dropped)`);
+        const candidate = merged.candidates[0];
+        if (!candidate.content.parts.length && candidate.finishReason === "MAX_TOKENS") {
+          // An empty bubble in Claude Desktop says nothing; this says what
+          // happened and what to do about it.
+          return fail(
+            `${targetModel} spent its whole token budget on reasoning and returned no answer. ` +
+              `Ask for more tokens, or pick one of the -low variants.`,
+            502
+          );
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(geminiToAnthropicResponse(merged, origModel)));
+      });
+      return;
+    }
+
+    let d = "";
+    upstreamRes.setEncoding("utf8");
+    upstreamRes.on("data", (c) => (d += c));
+    upstreamRes.on("end", () => {
+      console.log(`[proxy] [ANTIGRAVITY] ← ${upstreamRes.statusCode} (${d.length} bytes)`);
+      try {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(geminiToAnthropicResponse(unwrap(JSON.parse(d)), origModel)));
+      } catch (e) {
+        fail("unreadable response: " + e.message);
+      }
+    });
+  });
 }
 
 // ── Image pipeline ─────────────────────────────────────────
@@ -1495,7 +1637,9 @@ function handleImagePipeline(req, res, parsed, origModel) {
 
       console.log(`[proxy] [IMAGE] model map: ${origModel} → ${textModel} (${textEp.label})`);
 
-      if (textEp.type === "anthropic") {
+      if (textEp.type === "antigravity") {
+        sendAntigravityRequest(textEp, parsed, req, res, origModel, textModel);
+      } else if (textEp.type === "anthropic") {
         sendAnthropicRequest(textEp, parsed, req, res, origModel);
       } else {
         sendOpenCodeRequest(textEp, parsed, req, res, origModel);
@@ -1547,8 +1691,8 @@ function handleRequest(req, res) {
     // Root status endpoint
     const models = {};
     for (const [key, ep] of Object.entries(ENDPOINTS)) {
-      // A switched-off provider answers nothing, so its ids are not a route.
-      if (ep.modelMap && providerOn(key)) {
+      // An unusable provider answers nothing, so its ids are not a route.
+      if (ep.modelMap && providerReady(key)) {
         for (const [cModel, uModel] of Object.entries(ep.modelMap)) {
           models[cModel] = `${key}:${uModel}`;
         }
@@ -1560,6 +1704,7 @@ function handleRequest(req, res) {
       proxy: "claude-deepseek-proxy",
       endpoints: "DeepSeek + OpenCode Go + GLM (Z.ai) + Gemini Flash (auto image routing)",
       activeTextBackend: ENDPOINTS[getPrimaryTextEndpoint()].label,
+      googleAccounts: antigravity.summary(),
       catalog: Object.fromEntries(
         Object.keys(CATALOG_SOURCES).map((k) => [
           k,
@@ -1644,6 +1789,13 @@ function handleRequest(req, res) {
           },
         })
       );
+    }
+
+    // ── Google Antigravity (Cloud Code over a Google account) ──
+    if (ep.type === "antigravity") {
+      console.log(`[proxy] model map: ${origModel} → ${upstreamModel} (Google Antigravity)`);
+      sendAntigravityRequest(ep, parsed, req, res, origModel, upstreamModel);
+      return;
     }
 
     // ── Gemini as the text backend (also multimodal) ──
@@ -1758,9 +1910,17 @@ server.listen(PROXY_PORT, "127.0.0.1", () => {
     const activeEp = ENDPOINTS[activeKey];
     console.log(`\n  Claude → Multi-Backend Proxy (HTTPS)`);
     console.log(`  Listening:    https://127.0.0.1:${PROXY_PORT}`);
-    const keyNote = activeEp.apiKey || activeEp.custom ? "" : "  ⚠ no API key configured!";
+    const keyNote = providerReady(activeKey) ? "" : "  ⚠ not configured!";
     console.log(`  Text backend: ${activeEp.label}${keyNote}`);
-    console.log(`  Gemini Flash: auto image/OCR routing`);
+    const google = antigravity.summary();
+    if (google.length) {
+      console.log(`  Google accounts: ${google.map((a) => a.email).join(", ")}`);
+    }
+    console.log(
+      ENDPOINTS.gemini.apiKey
+        ? `  Images:       Google AI Studio (${ENDPOINTS.gemini.model}) → text backend`
+        : `  Images:       no AI Studio key${google.length ? " — handled by the Google account" : ""}`
+    );
     const off = Object.keys(ENDPOINTS).filter((k) => !providerOn(k));
     if (off.length) console.log(`  Switched off: ${off.map((k) => ENDPOINTS[k].label).join(", ")}`);
     const discovering = Object.keys(CATALOG_SOURCES).filter(discoveryOn);

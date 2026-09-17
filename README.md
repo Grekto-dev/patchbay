@@ -7,9 +7,9 @@
 **A local gateway that lets Claude Desktop run on other models.**
 
 Point the app at a proxy on your own machine and its model picker fills up with
-OpenCode Go, OpenRouter, DeepSeek, GLM, Google AI Studio and anything you run
-locally — including free models — while the interface, the tools and the
-workflow stay exactly as they are.
+OpenCode Go, OpenRouter, DeepSeek, GLM, Google (signed in with your account)
+and anything you run locally — including free models — while the interface, the
+tools and the workflow stay exactly as they are.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Node 18+](https://img.shields.io/badge/node-%E2%89%A518-5fa04e)
@@ -34,14 +34,16 @@ Claude Desktop                     │
       ▼                            │
 https://127.0.0.1:8877  ──────────►├─→ DeepSeek · GLM (Z.ai)
    Patchbay proxy                  │
-      ▲                            ├─→ Google AI Studio  text + images
+      ▲                            ├─→ Google Antigravity  signed in, not keyed
       │                            │
-http://127.0.0.1:8878              └─→ your own endpoint  Ollama · LM Studio · vLLM · …
-   Patchbay panel  ── start/stop · keys · models · live logs · diagnostics
+http://127.0.0.1:8878              ├─→ your own endpoint  Ollama · LM Studio · vLLM · …
+   Patchbay panel                  │
+      start/stop · keys · models    └─→ Google AI Studio  images only
+      live logs · diagnostics
 ```
 
-One text provider answers at a time. Images are always handled by Google —
-directly when it is also the text backend, through an OCR hand-off otherwise.
+One text provider answers at a time. Images take their own path: the AI Studio
+key reads them and the text provider writes the reply.
 
 ## Highlights
 
@@ -53,6 +55,10 @@ directly when it is also the text backend, through an OCR hand-off otherwise.
   hand-maintained lists that rot the week a provider renames something.
 - **Free models surfaced.** The free tiers on OpenCode and OpenRouter are
   discovered and labelled, with the cost of every other model next to it.
+- **Google without a key.** Connect a Google account and the Gemini line — plus
+  the Claude models Google hosts — answers through Antigravity's Cloud Code
+  surface, with per-model quota shown in the panel and several accounts rotated
+  as they hit their limits.
 - **Bring your own endpoint.** Anything that speaks the OpenAI API — Ollama,
   LM Studio, vLLM, llama.cpp, a company gateway — is added from the panel, over
   plain http on localhost if that is where it lives, with no key required.
@@ -69,8 +75,8 @@ directly when it is also the text backend, through an OCR hand-off otherwise.
 |---|---|
 | **Node.js 18+** | `node --version`. The setup scripts install it on Windows via winget if missing. |
 | **Claude Desktop** | Already installed and updated. |
-| **A text provider** | A key for [OpenCode Go](https://opencode.ai) · [OpenRouter](https://openrouter.ai/keys) · [DeepSeek](https://platform.deepseek.com) · [GLM / Z.ai](https://z.ai) · [Google AI Studio](https://aistudio.google.com/apikey), **or** a local server such as Ollama or LM Studio, which needs no key at all. One of them is enough; configure several and switch in the panel. |
-| **A Google AI Studio key** | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free tier, no card. It handles images whichever provider answers the text, so it is worth having even when it is not your text backend. |
+| **A text provider** | A key for [OpenCode Go](https://opencode.ai) · [OpenRouter](https://openrouter.ai/keys) · [DeepSeek](https://platform.deepseek.com) · [GLM / Z.ai](https://z.ai), a **Google account** for [Antigravity](#google-antigravity) (no key at all), **or** a local server such as Ollama or LM Studio. One of them is enough; configure several and switch in the panel. |
+| **A Google AI Studio key** *(optional)* | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free tier, no card. It is the image path: it reads the pictures whichever provider answers the text. |
 
 ---
 
@@ -232,16 +238,16 @@ in place, or rename it (a rename pins it too): pinned ids are kept in
 | DeepSeek | `https://api.deepseek.com/models` |
 | GLM (Z.ai) | `https://api.z.ai/api/coding/paas/v4/models`, falling back to `/api/paas/v4/models` |
 | OpenRouter | `https://openrouter.ai/api/v1/models` |
-| Google AI Studio | `https://generativelanguage.googleapis.com/v1beta/models` |
+| Google Antigravity | `v1internal:fetchAvailableModels` on `cloudcode-pa.googleapis.com`, signed with the connected account |
 | Custom provider | `<your base URL>/models` |
 
 Discovery is optional. With it off, the static maps in `proxy/server.js` apply:
 
-| Claude Desktop id | OpenCode Go | OpenRouter | DeepSeek | GLM | Google |
+| Claude Desktop id | OpenCode Go | OpenRouter | DeepSeek | GLM | Antigravity |
 |---|---|---|---|---|---|
-| `claude-sonnet-4-5` / `-4-6` | `deepseek-v4-flash` | `openrouter/auto` | `deepseek-v4-flash` | `glm-5-turbo` | `gemini-3.6-flash` |
-| `claude-opus-4-7` | `deepseek-v4-flash` | `openrouter/auto` | `deepseek-v4-pro` | `glm-5.2` | `gemini-3.8-flash` |
-| `claude-haiku-4-5-20251001` | `deepseek-v4-flash` | `openrouter/free` | `deepseek-v4-flash` | `glm-4.5-air` | `gemini-3.1-flash-lite` |
+| `claude-sonnet-4-5` / `-4-6` | `deepseek-v4-flash` | `openrouter/auto` | `deepseek-v4-flash` | `glm-5-turbo` | `gemini-3-flash` |
+| `claude-opus-4-7` | `deepseek-v4-flash` | `openrouter/auto` | `deepseek-v4-pro` | `glm-5.2` | `gemini-3.1-pro-low` |
+| `claude-haiku-4-5-20251001` | `deepseek-v4-flash` | `openrouter/free` | `deepseek-v4-flash` | `glm-4.5-air` | `gemini-3-flash` |
 
 A custom provider ships no static map: turn discovery on, or map its ids by
 hand in `proxy-config.json`.
@@ -363,34 +369,94 @@ Notes worth knowing:
 
 ---
 
-## Google AI Studio as a text provider
+## Google
 
-Gemini is not only the image backend. Pin **Google AI Studio** on the Keys tab
-(or configure no other provider key) and it answers everything — with its own
-discovered catalog, so a specific Gemini model stays reachable by id even while
-another provider handles the rest.
+Google enters Patchbay through two separate doors, and it is worth keeping them
+straight:
 
-Google lists image, music, speech and agent-only models side by side with the
-chat ones, all under `generateContent`, with no modality field to tell them
-apart. Patchbay filters the catalog down to text models: the Nano Banana /
-`*-image` family, Lyria (music), TTS and transcribe, Omni, Robotics-ER,
-Computer Use and `antigravity-*` / `deep-research-*` are dropped — the last two
-answer `This model only supports Interactions API` anyway. The whole
-`gemini-2.5-*` family is dropped too: Google retired it for new keys (404,
-"no longer available to new users") while still advertising it in the API.
+| | Credential | What it does |
+|---|---|---|
+| **Google Antigravity** | A Google account (OAuth) | A text provider like any other: the Gemini line plus the Claude models Google hosts. |
+| **Google AI Studio** | `GEMINI_API_KEY` | Images only — it reads the pictures and the text provider writes the reply. |
 
-The rule lives in `isTextModel()` in both `proxy/server.js` and `ui/server.js`;
-widen it there if Google ships a category this misses.
+### Google Antigravity
 
-Two things to know about the free tier:
+> [!CAUTION]
+> This uses the internal API behind Google's Antigravity IDE, signed in as you.
+> It is not a published API, using it may breach Google's Terms of Service, and
+> the upstream project reports accounts being **suspended or banned** for it.
+> Connect a spare account, not the one you depend on. Patchbay ships the
+> integration because it is useful; the risk is yours to take.
 
-- **Pro models answer 429.** `gemini-pro-latest` and `gemini-3.1-pro-preview`
-  are out of quota on a free key, which is why the defaults stay on Flash.
-  Discovery still lists them — pick one if your key has the quota.
-- **The `-latest` aliases currently resolve to thinking models.** Asking
-  `gemini-flash-latest` for a one-word answer took 53 seconds and spent the
-  entire token budget on thoughts before replying. The concrete ids in the
-  table above answer in about two seconds.
+**One-time setup.** Signing into Google needs an OAuth client, and the one this
+uses belongs to Google's Antigravity IDE rather than to Patchbay, so it is not
+committed to this repository. Copy the two values from
+[`src/constants.js`](https://github.com/badrisnarayanan/antigravity-claude-proxy/blob/main/src/constants.js)
+of the upstream project (`OAUTH_CONFIG.clientId` and `clientSecret`), or from
+your own Antigravity installation, into `.env`:
+
+```bash
+PATCHBAY_GOOGLE_CLIENT_ID=...apps.googleusercontent.com
+PATCHBAY_GOOGLE_CLIENT_SECRET=...
+```
+
+It is an *installed application* client — Google's own documentation says the
+secret of such a client is not treated as confidential — but it is not ours to
+publish, and GitHub's secret scanning is right to refuse it.
+
+Then connect an account on the **Keys & provider** tab: *Connect a Google
+account* opens Google's consent screen in a new tab, and when it comes back the
+account is listed with its tier and project. There is no key to paste and
+nothing to copy.
+
+What that buys you:
+
+- **The current Gemini line** — Flash, Pro and the Lite variants — plus the
+  Claude models Google serves through the same surface, all discovered live
+  like any other catalog.
+- **Per-model quota, shown in the panel.** The Models table prints what is left
+  of each model's allowance (`43% quota`, or `spent`) instead of a price,
+  because there is no price.
+- **Several accounts, rotated.** Quota is per account, so connect more than one
+  and Patchbay picks the least recently used one that is not cooling down. A
+  `429` puts that account aside — a minute at first, escalating to two hours if
+  it keeps refusing — and the request is retried on the next account.
+
+Ids follow the model name rather than the cost: `pro` lands in the `opus`
+family, `lite` in `haiku`, `flash` in `sonnet`, and Google's Claude models keep
+their own family.
+
+Credentials live in `google-accounts.json` in the project root, gitignored and
+written `0600`: a refresh token, the discovered project id and the tier. Delete
+the file, or press **remove** in the panel, and the connection is gone. To
+revoke Patchbay's access entirely, use
+[myaccount.google.com/permissions](https://myaccount.google.com/permissions).
+
+Two things that surprise people:
+
+- **A fresh account has no project.** The first request provisions one through
+  Google's onboarding call, which takes a few seconds; the panel shows
+  `no project yet` until it lands.
+- **Gemini 3 models are thinking models.** They only answer over a stream, so a
+  non-streaming request is served by merging the stream back together — and the
+  reasoning is dropped, not printed as the reply.
+- **Reasoning is charged to the answer's budget.** Ask for 64 tokens and the
+  model can spend all 64 thinking and hand back an empty reply with
+  `MAX_TOKENS`. Patchbay asks for at least 16k so that cannot happen, and says
+  so plainly if it happens anyway. The amount of reasoning is picked by the
+  model id — `-low`, `-medium`, `-high` — so use a `-low` variant when you want
+  a fast answer more than a considered one.
+- **The picker shows Google's names.** `labelOverride` defaults to the display
+  name the API reports ("Gemini 3.6 Flash (Medium)", "Claude Opus 4.6
+  (Thinking)") rather than the raw id. Rename any of them in the Models table.
+
+### Google AI Studio
+
+The AI Studio key no longer answers text at all: it is the image path, and only
+that. Get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+(free tier, no card). Without it, images are handled by a connected Google
+account instead; without either, they are passed to the text provider as they
+are.
 
 ---
 
@@ -399,11 +465,14 @@ Two things to know about the free tier:
 ```
 image in the request
         │
-        ├── Google is the text backend ──→ sent straight to Gemini (multimodal)
+        ├── an AI Studio key is set ─────→ Gemini reads it, the description is
+        │                                  injected into the prompt, and the
+        │                                  text provider writes the reply
         │
-        └── another provider answers ────→ Gemini describes it, the description
-                                           is injected into the prompt, and the
-                                           text provider writes the reply
+        ├── no key, a Google account ────→ Google Antigravity answers directly
+        │                                  (those models are multimodal)
+        │
+        └── neither ────────────────────→ passed to the text provider as-is
 ```
 
 Supported formats: JPEG, PNG, WEBP, HEIC, HEIF.
@@ -421,12 +490,12 @@ OPENCODE_API_KEY=...     # https://opencode.ai
 OPENROUTER_API_KEY=...   # https://openrouter.ai/keys
 GLM_API_KEY=...          # https://z.ai
 DEEPSEEK_API_KEY=...     # https://platform.deepseek.com
-GEMINI_API_KEY=...       # https://aistudio.google.com/apikey
+GEMINI_API_KEY=...       # https://aistudio.google.com/apikey — images only
 PATCHBAY_OLLAMA_API_KEY= # only if that custom provider needs one
 ```
 
 With more than one configured, priority is **OpenCode Go → OpenRouter → GLM →
-DeepSeek → Google AI Studio**, and custom providers come after those. Pinning a
+DeepSeek → Google Antigravity**, and custom providers come after those. Pinning a
 provider in the panel overrides the order.
 
 ### `proxy-config.json`
@@ -438,10 +507,10 @@ Delete it to return to the built-in defaults. Nothing here rewrites
 ```jsonc
 {
   "port": 8877,                       // proxy port
-  "provider": "gemini",               // pinned text provider
+  "provider": "antigravity",          // pinned text provider
   "discovery": {                      // pull live catalogs
     "opencode": true,
-    "gemini": true
+    "antigravity": true
   },
   "providersOff": {                   // switched off entirely: no routing, no ids
     "deepseek": true
@@ -513,9 +582,11 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 ├── setup.bat / setup.sh     Interactive first-time setup
 ├── .env                     API keys (gitignored)
 ├── proxy-config.json        Panel-written overrides (gitignored)
+├── google-accounts.json     Google OAuth accounts (gitignored, 0600)
 ├── assets/logo.svg
 ├── proxy/
 │   ├── server.js            The proxy: routing, format translation, catalogs
+│   ├── antigravity.js       Google accounts, tokens, quota rotation, Cloud Code
 │   └── test-proxy.js        Connectivity test
 ├── ui/
 │   ├── server.js            Control panel server (no dependencies)
@@ -554,9 +625,11 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 | Every model answers as the same one | The app's list was imported before the ids changed, so its entries no longer match. Re-export from the Models tab and import again. |
 | `MissingSessionID` from OpenCode | OpenCode requires an `x-opencode-session` header; the proxy sends one. Seeing this means an older `proxy/server.js` is running. |
 | `Model … is not supported` (OpenCode) | The model lives on the other OpenCode surface. Enable discovery so the proxy learns which base each model belongs to. |
-| `429 quota exceeded` (Google) | Gemini Pro models are not available on the free AI Studio tier. Use a Flash model or enable billing. |
-| `404 no longer available to new users` (Google) | A retired model id. Refresh the catalog in the panel; `gemini-2.5-*` is filtered out for this reason. |
-| Gemini takes ~1 minute for a short answer | A thinking model burning the budget before replying, typically through a `-latest` alias. Pick a concrete id such as `gemini-3.6-flash`. |
+| `every Google account is rate-limited` | The connected accounts are all cooling down after a `429`. The message says for how long; connect another account to widen the pool. |
+| `no Google account connected` | Antigravity has no credentials. Keys & provider → **Connect a Google account**. |
+| Google sign-in returns no refresh token | Google only issues one on first consent. Remove Patchbay at [myaccount.google.com/permissions](https://myaccount.google.com/permissions) and connect again. |
+| `ACCOUNT_BANNED` / 403 from Google | Google disabled that account for using this surface. Nothing to fix from here — see the warning in [Google Antigravity](#google-antigravity). |
+| Images stopped working | The AI Studio key is the image path and it is separate from the text provider. Check `GEMINI_API_KEY` on the Keys tab. |
 | Image upload returns 503 | Use drag & drop or the `+` button; the Quick Entry shortcut bypasses the gateway. |
 | Panel says the port is in use | It is already open in another window, or something else holds 8878. `UI_PORT=8879 node ui/server.js`. |
 | Live logs stay empty | The proxy was started outside the panel. Stop it and start it from the panel. |
@@ -604,6 +677,15 @@ the original project worked out the hard parts: that Claude Desktop needs a
 properly chained local CA, that its connectivity probes must be intercepted,
 and how the gateway plumbing fits together. Thank you for building and
 publishing it; everything here stands on that work.
+
+The Google backend is built on
+**[badrisnarayanan/antigravity-claude-proxy](https://github.com/badrisnarayanan/antigravity-claude-proxy)**,
+which worked out how to talk to Antigravity's Cloud Code surface: the OAuth
+client and scopes, the `v1internal` endpoints and their fallback order, the
+client metadata the server insists on, the project onboarding dance, and the
+`[ignore]` system-prompt trick that stops the model introducing itself as
+Antigravity. Patchbay reimplements that protocol in its own shape — no
+dependencies, one file — but none of it was reverse-engineered here. Thank you.
 
 Thanks also to [models.dev](https://models.dev) for the open model database
 behind the cost and free-tier labels.

@@ -259,6 +259,11 @@ select { font-family: inherit; cursor: pointer; }
 
 td.tight, th.tight { width: 44px; }
 .tag.count { font-variant-numeric: tabular-nums; }
+.gacct { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev-2); }
+.gline { display: flex; align-items: center; gap: 8px; }
+.gmail { font-weight: 600; font-size: 13px; }
+.gline .rm { margin-left: auto; }
+.ghint { margin-top: 4px; font-size: 12px; color: var(--text-faint); }
 .tag.count.zero { opacity: .55; }
 .tag.off { background: var(--bg-elev-2); color: var(--text-faint); border-color: var(--border); }
 .card.off .card-head > div:first-child { opacity: .6; }

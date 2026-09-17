@@ -191,7 +191,9 @@ function renderChecklist(s) {
   });
   items.push({
     ok: Boolean(gem && gem.set),
-    txt: gem && gem.set ? "Google AI Studio key configured (images/OCR)" : "Add the Google AI Studio key (used for images/OCR)",
+    txt: gem && gem.set
+      ? "Google AI Studio key configured (images only)"
+      : "Add the Google AI Studio key — without it images go to the Google account, or nowhere",
   });
   items.push({ ok: s.certs.ok, txt: s.certs.ok ? "TLS certificates present" : "Generate the certificates on the Diagnostics tab" });
   // A present certificate the OS does not trust fails exactly like a missing one.
@@ -217,34 +219,172 @@ function renderChecklist(s) {
   );
 }
 
-function renderKeys(s) {
-  const show = $("#chk-show-keys").checked;
-  setChildren(
-    $("#key-fields"),
-    s.keys.map((k) =>
+// Google is signed in, not pasted: one card with the connected accounts and a
+// button that opens Google's consent screen.
+function tierLabel(tier) {
+  const t = String(tier || "").toLowerCase();
+  if (t.includes("ultra")) return "Ultra";
+  if (t === "standard-tier" || t.includes("pro") || t.includes("premium")) return "Pro";
+  if (t.includes("free")) return "Free tier";
+  return tier || "unknown tier";
+}
+
+function googleField(k, s) {
+  const accounts = (s.google && s.google.accounts) || [];
+  const ready = Boolean(s.google && s.google.clientConfigured);
+
+  const rows = accounts.map((a) =>
+    el(
+      "div",
+      { class: "gacct" },
       el(
-        "label",
-        { class: "field" },
-        el(
-          "span",
-          { class: "lab" },
-          k.label,
-          el("small", {}, k.env),
-          k.set ? el("span", { class: "tag ok" }, k.masked) : el("span", { class: "tag warn" }, "not configured"),
-          k.set ? el("button", { class: "rm", type: "button", onclick: (e) => removeKey(k, e.target) }, "remove") : null,
-          el("a", { href: k.url, target: "_blank", rel: "noreferrer", style: "margin-left:auto;font-size:12px;font-weight:400" }, "get a key ↗")
-        ),
-        k.note ? el("span", { class: "fieldnote" }, k.note) : null,
-        el("input", {
-          type: show ? "text" : "password",
-          "data-env": k.env,
-          "data-rendered": "",
-          placeholder: k.set ? "•••• keep the current key" : "paste the key here",
-          autocomplete: "off",
-          spellcheck: "false",
-        })
+        "div",
+        { class: "gline" },
+        el("span", { class: "gmail" }, a.email),
+        a.tier ? el("span", { class: "tag info" }, tierLabel(a.tier)) : null,
+        a.cooldownMs
+          ? el("span", { class: "tag warn" }, "rate-limited · " + Math.ceil(a.cooldownMs / 1000) + "s")
+          : el("span", { class: "tag ok" }, "ready"),
+        el("button", { class: "rm", type: "button", onclick: (e) => removeGoogle(a.email, e.target) }, "remove")
+      ),
+      el(
+        "div",
+        { class: "ghint" },
+        a.projectId ? "project " + a.projectId : "no project yet — it is provisioned on the first request",
+        a.lastError ? " · " + a.lastError : ""
       )
     )
+  );
+
+  return el(
+    "div",
+    { class: "field" },
+    el(
+      "span",
+      { class: "lab" },
+      k.label,
+      el("small", {}, "Google account"),
+      accounts.length
+        ? el("span", { class: "tag ok" }, accounts.length + (accounts.length === 1 ? " account" : " accounts"))
+        : el("span", { class: "tag warn" }, "not connected"),
+      el(
+        "a",
+        { href: k.url, target: "_blank", rel: "noreferrer", style: "margin-left:auto;font-size:12px;font-weight:400" },
+        "about ↗"
+      )
+    ),
+    el("span", { class: "fieldnote" }, k.note),
+    ...rows,
+    ready
+      ? null
+      : el(
+          "p",
+          { class: "hint", style: "margin:10px 0 0" },
+          "No OAuth client configured. Add ",
+          el("code", { class: "inline-code" }, "PATCHBAY_GOOGLE_CLIENT_ID"),
+          " and ",
+          el("code", { class: "inline-code" }, "PATCHBAY_GOOGLE_CLIENT_SECRET"),
+          " to .env — the README (Google Antigravity) says where the two values come from."
+        ),
+    el(
+      "div",
+      { class: "actions", style: "margin-top:10px" },
+      el(
+        "button",
+        { class: "primary sm", type: "button", disabled: !ready, onclick: (e) => connectGoogle(e.target) },
+        "Connect a Google account"
+      ),
+      el("span", { class: "spacer" }),
+      el(
+        "span",
+        { class: "hint", style: "margin:0" },
+        accounts.length ? "More accounts means more quota: Patchbay rotates between them." : "Opens Google's consent screen in a new tab."
+      )
+    )
+  );
+}
+
+function connectGoogle(btn) {
+  // The popup has to be opened on the click itself, before any await, or the
+  // browser blocks it.
+  const tab = window.open("about:blank", "_blank");
+  withBusy(btn, async () => {
+    const r = await api("/api/google/connect", {});
+    if (r.error) {
+      if (tab) tab.close();
+      return toast(r.error, "err");
+    }
+    if (tab) tab.location = r.url;
+    else toast("Allow pop-ups, or open this URL yourself: " + r.url, "err");
+    toast("Finish the sign-in in the tab that just opened.", "ok");
+    watchGoogleFlow();
+  });
+}
+
+// The consent screen lands on a local callback the proxy module owns, so the
+// panel only learns about it by asking.
+async function watchGoogleFlow() {
+  const started = Date.now();
+  while (Date.now() - started < 5 * 60 * 1000) {
+    await new Promise((r) => setTimeout(r, 2000));
+    let r;
+    try {
+      r = await api("/api/google/status");
+    } catch {
+      continue;
+    }
+    const result = r.flow && r.flow.result;
+    if (!result) continue;
+    if (result.error) toast("Google sign-in failed: " + result.error, "err");
+    else {
+      toast("Connected " + result.email + (result.warning ? " (" + result.warning + ")" : "") + ".", "ok");
+      // The proxy reads the accounts file at startup, so it has to be told.
+      if (state && state.proxy.running) markRestart(true);
+      await loadCatalog(true);
+    }
+    refresh(true);
+    return;
+  }
+}
+
+async function removeGoogle(email, btn) {
+  if (!confirm("Remove " + email + " from Patchbay?\n\nIts models stop working until another account is connected.")) return;
+  await withBusy(btn, async () => {
+    const r = await api("/api/google/remove", { email });
+    if (r.error) return toast(r.error, "err");
+    toast(email + " removed.", "ok");
+    if (state && state.proxy.running) markRestart(true);
+    await loadCatalog(true);
+  });
+}
+
+function renderKeys(s) {
+  const show = $("#chk-show-keys").checked;
+  setChildren($("#key-fields"), s.keys.map((k) => (k.oauth ? googleField(k, s) : keyField(k, show))));
+}
+
+function keyField(k, show) {
+  return el(
+    "label",
+    { class: "field" },
+    el(
+      "span",
+      { class: "lab" },
+      k.label,
+      el("small", {}, k.env),
+      k.set ? el("span", { class: "tag ok" }, k.masked) : el("span", { class: "tag warn" }, "not configured"),
+      k.set ? el("button", { class: "rm", type: "button", onclick: (e) => removeKey(k, e.target) }, "remove") : null,
+      el("a", { href: k.url, target: "_blank", rel: "noreferrer", style: "margin-left:auto;font-size:12px;font-weight:400" }, "get a key ↗")
+    ),
+    k.note ? el("span", { class: "fieldnote" }, k.note) : null,
+    el("input", {
+      type: show ? "text" : "password",
+      "data-env": k.env,
+      "data-rendered": "",
+      placeholder: k.set ? "•••• keep the current key" : "paste the key here",
+      autocomplete: "off",
+      spellcheck: "false",
+    })
   );
 }
 
@@ -313,13 +453,28 @@ $("#btn-add-provider").addEventListener("click", (e) =>
 function renderProviders(s) {
   const current = s.pinnedProvider || "auto";
   const opts = [
-    { key: "auto", label: "Automatic", desc: "Follows the OpenCode Go → OpenRouter → GLM → DeepSeek → Google priority, custom providers last.", enabled: true },
-    ...s.providers.map((p) => ({
-      key: p.key,
-      label: p.label,
-      desc: s.configuredProviders.includes(p.key) ? "Key configured." : "No key — set " + p.env + " before pinning it.",
-      enabled: s.configuredProviders.includes(p.key),
-    })),
+    {
+      key: "auto",
+      label: "Automatic",
+      desc: "Follows the OpenCode Go → OpenRouter → GLM → DeepSeek → Google Antigravity priority, custom providers last.",
+      enabled: true,
+    },
+    ...s.providers
+      .filter((p) => !p.imagesOnly)
+      .map((p) => ({
+        key: p.key,
+        label: p.label,
+        desc: s.configuredProviders.includes(p.key)
+          ? p.oauth
+            ? "Google account connected."
+            : "Key configured."
+          : ((s.config && s.config.providersOff) || {})[p.key]
+          ? "Switched off on the Models tab."
+          : p.oauth
+          ? "Connect a Google account before pinning it."
+          : "No key — set " + p.env + " before pinning it.",
+        enabled: s.configuredProviders.includes(p.key),
+      })),
   ];
 
   $("#provider-list").replaceChildren(
@@ -493,11 +648,23 @@ function sortModels(p, models, on) {
   });
 }
 
+// What Claude Desktop shows in its picker. A provider that publishes a proper
+// display name ("Gemini 3.6 Flash (Medium)") beats its own model id as the
+// default; anything the user typed beats both.
+function defaultLabel(p, model) {
+  const meta = p.quota && p.quota[model];
+  return (meta && meta.displayName) || model;
+}
+
+function labelOf(p, model) {
+  return (p.labels && p.labels[model]) || defaultLabel(p, model);
+}
+
 function modelMatches(p, model, filters, on) {
   const id = p.ids[model] || "";
   const cost = (p.pricing && p.pricing[model]) || null;
 
-  const label = (p.labels && p.labels[model]) || model;
+  const label = labelOf(p, model);
   if (
     filters.search &&
     !model.toLowerCase().includes(filters.search) &&
@@ -525,6 +692,20 @@ function modelMatches(p, model, filters, on) {
   if (filters.mapping === "discovered" && mapped) return false;
 
   return true;
+}
+
+// Antigravity reports what is left of each model's daily quota. Nothing else
+// does, so this quietly returns null for every other provider.
+function quotaTag(p, model) {
+  const q = p.quota && p.quota[model];
+  if (!q || q.remaining === null || q.remaining === undefined) return null;
+  const pct = Math.round(q.remaining * 100);
+  const cls = pct <= 0 ? "err" : pct < 20 ? "warn" : "ok";
+  return el(
+    "span",
+    { class: "tag " + cls, title: q.resetTime ? "resets " + q.resetTime : "quota left on the connected account" },
+    pct <= 0 ? "spent" : pct + "% quota"
+  );
 }
 
 // A model already mapped by hand in proxy/server.js for this provider.
@@ -735,11 +916,12 @@ function providerCard(p, live, isActive, filters) {
         el(
           "td",
           {},
-          cost && !cost.free
-            ? el("span", { class: "cost", title: "models.dev: $/M tokens" }, "$" + cost.input + " / $" + cost.output)
-            : isStaticallyMapped(p.key, m)
-            ? el("span", { class: "tag info" }, "static map")
-            : ""
+          quotaTag(p, m) ||
+            (cost && !cost.free
+              ? el("span", { class: "cost", title: "models.dev: $/M tokens" }, "$" + cost.input + " / $" + cost.output)
+              : isStaticallyMapped(p.key, m)
+              ? el("span", { class: "tag info" }, "static map")
+              : "")
         )
       );
       box.addEventListener("change", () => {
@@ -840,7 +1022,7 @@ function labelCell(p, model) {
   const td = el("td", { class: "idcell" });
 
   const paint = () => {
-    const label = (p.labels && p.labels[model]) || model;
+    const label = labelOf(p, model);
     const custom = Boolean(p.labels && p.labels[model]);
     td.replaceChildren(
       el(
@@ -856,7 +1038,7 @@ function labelCell(p, model) {
     const input = el("input", {
       type: "text",
       class: "idinput",
-      value: (p.labels && p.labels[model]) || model,
+      value: labelOf(p, model),
       spellcheck: "false",
     });
     td.replaceChildren(input);
@@ -1146,7 +1328,7 @@ function buildExportPayload() {
       const family = (name.match(/^claude-(haiku|sonnet|opus)\b/) || [])[1] || "sonnet";
       inferenceModels.push({
         name,
-        labelOverride: (p.labels && p.labels[m]) || m,
+        labelOverride: labelOf(p, m),
         anthropicFamilyTier: family,
       });
     }
